@@ -37,3 +37,30 @@ async def test_channels_isolated():
     await bus.publish("jobA", {"m": "right"})
     await t
     assert got == [{"m": "right"}]
+
+
+@pytest.mark.asyncio
+async def test_subscriber_queue_removed_after_consumer_exits():
+    # Plain `break` out of `async for` does NOT synchronously close the
+    # underlying async generator (its `finally` only runs on GC, which is
+    # non-deterministic), so cancel the consumer task instead — cancellation
+    # delivers CancelledError at the generator's suspended `await q.get()`,
+    # which runs the `finally` cleanup synchronously as part of unwinding.
+    bus = ProgressBus()
+    received = []
+
+    async def consumer():
+        async for evt in bus.subscribe("job1"):
+            received.append(evt)
+
+    consumer_task = asyncio.create_task(consumer())
+    await asyncio.sleep(0.01)
+    await bus.publish("job1", {"type": "log", "msg": "hello"})
+    await asyncio.sleep(0.01)
+
+    consumer_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer_task
+
+    assert received == [{"type": "log", "msg": "hello"}]
+    assert bus._queues["job1"] == []

@@ -7,8 +7,19 @@ import json
 from pathlib import Path
 from datasets import load_dataset
 
-OUT = Path(__file__).parent.parent / "src/b2cq_data/calibration/bundled.jsonl"
+try:
+    # Resolve via the installed package so this script writes to the same
+    # location the runtime loader (b2cq.calibration._BUNDLED_PATH) reads from,
+    # regardless of the cwd/copy-location the script is invoked from (e.g. the
+    # Dockerfile COPYs this script to /tmp and runs it there, while the
+    # package is installed editable at /app/src).
+    import b2cq_data
+
+    OUT = Path(b2cq_data.__file__).parent / "calibration" / "bundled.jsonl"
+except ImportError:
+    OUT = Path(__file__).parent.parent / "src/b2cq_data/calibration/bundled.jsonl"
 OUT.parent.mkdir(parents=True, exist_ok=True)
+print(f"Resolved OUT path: {OUT}")
 
 samples = []
 
