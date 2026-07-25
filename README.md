@@ -39,6 +39,8 @@ One calibration source per job, feeding both lanes uniformly (llm-compressor cal
 2. **Uploaded JSONL** — OpenAI-messages format.
 3. **HF dataset ID** — downloaded with the job's token; falls back to the bundled corpus if unreachable.
 
+For the safetensors lane, calibration rendering is automatic and artifact-class-aware: if the source model repo carries a `tekken.json` (all FrndoBrain-class merges do, byte-identical to the base Mistral repo), calibration is rendered exclusively through `mistral-common` with the tools-block flipped to the first user turn, matching the training/serving invariant — never through the HF chat template, since even a byte-level rendering difference would bake calibration/inference divergence into the quantized weights. A calibration sample that fails to render under mistral-common hard-fails the job rather than silently falling back, since that means the calibration corpus doesn't match the training contract. Generic Mistral models (no `tekken.json`) calibrate via the standard HF `apply_chat_template` path. See `SPEC.md` §14 for the full invariant set and version pin.
+
 ### Source README update
 
 After uploads complete, the app commits a canonical `## Quantizations` table (Format | Repo | Notes) to the source repo's `main` branch — idempotent, replacing the section on subsequent runs. If the token can't write to the source repo (e.g., quantizing someone else's base model), it logs a warning and skips; quants stay uploaded.

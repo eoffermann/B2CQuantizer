@@ -204,45 +204,73 @@ def _build_recipe(format: str, arch: str, model):
     raise ValueError(f"unsupported safetensors format: {format!r}")
 
 
-def _render_calibration_texts(
-    samples: list[dict],
-    tokenizer,
-    source_dir: Path | None,
-    log_cb: Callable[[str], None],
-) -> list[str]:
-    """Render `{"messages": [...]}` calibration samples to text for oneshot.
+def is_frndobrain_class(source_dir: Path) -> bool:
+    """Detect FrndoBrain-class artifact by presence of tekken.json in source.
 
-    FrndoBrain-style Mistral artifacts ship a native `tekken.json` tokenizer
-    that must be rendered via `mistral-common`, not transformers' chat
-    template machinery. When a `tekken.json` sits alongside the model,
-    prefer mistral-common; otherwise fall back to the already-loaded
-    transformers tokenizer's `apply_chat_template`.
+    FrndoBrain merges carry tekken.json byte-identical to the base Mistral repo
+    per the tokenizer-invariant training contract. Its presence marks an artifact
+    whose calibration MUST go through mistral-common with the tool-placement flip.
+    See SPEC §14 for the full invariant set.
     """
-    if source_dir is not None:
-        tekken_path = Path(source_dir) / "tekken.json"
-        if tekken_path.exists():
-            try:
-                from mistral_common.protocol.instruct.request import ChatCompletionRequest
-                from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+    return (Path(source_dir) / "tekken.json").exists()
 
-                mc_tokenizer = MistralTokenizer.from_file(str(tekken_path))
-                texts = []
-                for sample in samples:
-                    request = ChatCompletionRequest(messages=sample["messages"])
-                    tokenized = mc_tokenizer.encode_chat_completion(request)
-                    texts.append(tokenized.text)
-                log_cb("Rendered calibration text via mistral-common (tekken.json tokenizer)")
-                return texts
-            except ImportError as e:
-                # mistral-common not installed, or the import path guessed above
-                # doesn't match the installed version; fall back to transformers
-                # below, but make the fallback visible instead of silent.
-                log_cb(
-                    f"mistral-common unavailable ({e}); falling back to transformers "
-                    "chat template for calibration"
-                )
 
-    return [tokenizer.apply_chat_template(sample["messages"], tokenize=False) for sample in samples]
+# Pin locked to what the FrndoBrain serving stack ships. The private attribute
+# below is version-fragile -- it was `_user_message_position_to_encode_tools` in
+# mistral-common 1.9.x and renamed to `_message_position_to_encode_tools_settings`
+# in 1.11.x. Silent divergence between calibration-time and serving-time
+# tokenization gets baked into the quantized weights; hence the hard-fails.
+_EXPECTED_MISTRAL_COMMON = "1.11.5"
+_TOOL_PLACEMENT_ATTR = "_message_position_to_encode_tools_settings"
+
+
+def build_frndobrain_tokenizer(source_dir: Path):
+    """Build a mistral-common MistralTokenizer with the tools-at-first-user-turn
+    flip, pinned to the version the serving stack ships. Fails loudly if
+    version or attribute has drifted."""
+    import mistral_common
+    from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+    from mistral_common.tokens.tokenizers.base import UserMessagePosition
+    from mistral_common.protocol.instruct.validator import ValidationMode
+
+    if mistral_common.__version__ != _EXPECTED_MISTRAL_COMMON:
+        raise RuntimeError(
+            f"mistral-common version mismatch: got {mistral_common.__version__}, "
+            f"expected {_EXPECTED_MISTRAL_COMMON}. FrndoBrain-class calibration "
+            "is version-locked to match training + serving; audit the InstructTokenizer "
+            "source and update the pin (see SPEC §14 for the drift history)."
+        )
+    # Load from the local source_dir (tekken.json lives here).
+    tok = MistralTokenizer.from_file(str(Path(source_dir) / "tekken.json"),
+                                      mode=ValidationMode.finetuning)
+    it = tok.instruct_tokenizer
+    if not hasattr(it, _TOOL_PLACEMENT_ATTR):
+        raise RuntimeError(
+            f"expected attribute {_TOOL_PLACEMENT_ATTR!r} not present on "
+            f"{type(it).__name__}; attribute has moved again -- audit InstructTokenizer "
+            "source and update the pin."
+        )
+    setattr(it, _TOOL_PLACEMENT_ATTR, UserMessagePosition.first)
+    return tok
+
+
+def _render_calibration_frndobrain(mtok, sample: dict) -> str:
+    """Render one calibration sample via mistral-common. Sample shape is
+    {messages: [...], tools: [...] or omitted}. Returns plain text -- llm-compressor
+    will re-tokenize with the model's HF tokenizer, which for FrndoBrain artifacts
+    produces the same IDs since tokenizer.json is regenerated from tekken.json
+    at training time. What matters is the CONVERSATION STRUCTURE is rendered by
+    mistral-common (so [AVAILABLE_TOOLS] lands at first user turn, tool_calls
+    render with V11's [CALL_ID] format, etc.)."""
+    from mistral_common.protocol.instruct.request import ChatCompletionRequest
+
+    req = ChatCompletionRequest(messages=sample["messages"], tools=sample.get("tools"))
+    return mtok.encode_chat_completion(req).text
+
+
+def _render_calibration_hf(tokenizer, sample: dict) -> str:
+    """Fallback render for non-FrndoBrain Mistral models. Uses HF chat template."""
+    return tokenizer.apply_chat_template(sample["messages"], tokenize=False)
 
 
 def quantize_safetensors(
@@ -251,24 +279,23 @@ def quantize_safetensors(
     format: str,
     calibration: list[dict],
     output_dir: Path,
+    source_dir: Path,
     log_cb: Callable[[str], None],
-    source_dir: Path | None = None,
 ) -> None:
     """Run one llm-compressor oneshot quantization pass for `format`.
 
     `model`/`tokenizer` come from `load_model_for_safetensors`, loaded once
     per lane and reused across formats. `source_dir` is the on-disk source
-    model directory -- needed for two things the loaded model/tokenizer
-    objects don't carry: (a) detecting a native Mistral `tekken.json`
-    tokenizer for calibration rendering, and (b) tokenizer/runtime-artifact
-    carry-forward after save. Pass it explicitly when available (the Lane A
-    orchestrator has it on hand from the original download). If omitted, it
-    falls back to `model.config._name_or_path` -- the path/repo id
-    `from_pretrained` recorded the model as having been loaded from -- which
-    is best-effort and may be `None`/stale for models loaded in unusual ways.
+    model directory and is REQUIRED -- it is where artifact-class detection
+    (`is_frndobrain_class`) and the mistral-common tekken.json tokenizer are
+    read from, and where post-quant tokenizer/runtime-artifact carry-forward
+    pulls from. See SPEC §14 for why the calibration render path depends on
+    artifact class rather than best-effort import success.
     """
     if not calibration:
         raise ValueError("calibration is empty")
+
+    source_dir = Path(source_dir)
 
     arch = model.config.architectures[0]
     # _build_recipe validates `arch` against the supported set before doing
@@ -277,20 +304,40 @@ def quantize_safetensors(
     # inside llm-compressor after calibration rendering / model prep.
     recipe = _build_recipe(format, arch, model)
 
-    from llmcompressor.transformers import oneshot
-
-    if source_dir is None:
-        name_or_path = getattr(model.config, "_name_or_path", None)
-        source_dir = Path(name_or_path) if name_or_path else None
-    else:
-        source_dir = Path(source_dir)
-
     samples = calibration[:DEFAULT_NUM_CALIBRATION_SAMPLES]
     log_cb(
         f"Preparing {len(samples)} calibration samples "
         f"(of {len(calibration)} provided, target {DEFAULT_NUM_CALIBRATION_SAMPLES})"
     )
-    texts = _render_calibration_texts(samples, tokenizer, source_dir, log_cb)
+
+    # Detect artifact class and pick the calibration render path. Per SPEC
+    # §14, this dispatch is NOT best-effort/try-except-on-import: the render
+    # path is determined by whether the artifact IS FrndoBrain-class, not by
+    # whether mistral-common happens to be importable.
+    if is_frndobrain_class(source_dir):
+        log_cb(f"FrndoBrain-class artifact detected (tekken.json present in {source_dir})")
+        log_cb("Calibration rendering via mistral-common with tools-at-first-user-turn flip")
+        mtok = build_frndobrain_tokenizer(source_dir)
+        # If ANY calibration sample fails to render, fail loudly -- the
+        # user's calibration corpus does not match the training invariant
+        # and would produce calibration/inference divergence baked into the
+        # quantized weights.
+        try:
+            texts = [_render_calibration_frndobrain(mtok, s) for s in samples]
+        except Exception as e:
+            raise RuntimeError(
+                f"FrndoBrain-class calibration failed to render at least one sample "
+                f"via mistral-common: {type(e).__name__}: {e}. This means your "
+                "calibration corpus does not match the training/serving invariant. "
+                "For best results, calibrate on the same data (or a same-shape subset) "
+                "as was used for training. See SPEC §14 for the invariants that must hold."
+            ) from e
+    else:
+        log_cb(f"Generic Mistral artifact (no tekken.json in {source_dir})")
+        log_cb("Calibration rendering via HF chat template")
+        texts = [_render_calibration_hf(tokenizer, s) for s in samples]
+
+    from llmcompressor.transformers import oneshot
 
     log_cb(f"Starting oneshot quantization: {format}")
     oneshot(
@@ -309,7 +356,7 @@ def quantize_safetensors(
             "(missing config.json and/or *.safetensors files)"
         )
 
-    if source_dir is not None and source_dir.exists():
+    if source_dir.exists():
         from shutil import copy
 
         for name in _CARRY_FORWARD_ARTIFACTS:

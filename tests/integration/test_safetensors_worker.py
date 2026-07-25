@@ -26,6 +26,6 @@ def test_quantize_w4a16_gptq_smoke(tmp_path):
     output = tmp_path / "gptq"
     quantize_safetensors(model, tok, "W4A16_GPTQ",
                          calibration=[{"messages": [{"role": "user", "content": "hi"}]}] * 8,
-                         output_dir=output, log_cb=logs.append)
+                         output_dir=output, source_dir=source, log_cb=logs.append)
     assert (output / "config.json").exists()
     assert any(f.name.endswith(".safetensors") for f in output.iterdir())

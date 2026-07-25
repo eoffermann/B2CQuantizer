@@ -134,8 +134,7 @@ async def _run_one_safetensors_quant(job, q, model, tokenizer, source_dir, calib
         output_dir = workdir / f"safetensors_{q.quant_id}"
         await asyncio.to_thread(
             quantize_safetensors,
-            model, tokenizer, get_quant(q.quant_id).format, calibration, output_dir, log_cb,
-            source_dir=source_dir,
+            model, tokenizer, get_quant(q.quant_id).format, calibration, output_dir, source_dir, log_cb,
         )
         q.status = QuantStatus.UPLOADING
         await progress.publish(job.id, {"type": "status", "quant": q.quant_id, "status": q.status})

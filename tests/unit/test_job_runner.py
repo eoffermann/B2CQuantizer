@@ -90,7 +90,7 @@ def _fake_load_model_for_safetensors(source_dir, log_cb):
     return ("MODEL", "TOKENIZER")
 
 
-def _fake_quantize_safetensors(model, tokenizer, format, calibration, output_dir, log_cb, source_dir=None):
+def _fake_quantize_safetensors(model, tokenizer, format, calibration, output_dir, source_dir, log_cb):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "model.safetensors").write_bytes(b"fake-weights")
@@ -285,7 +285,7 @@ async def test_quantize_safetensors_receives_explicit_source_dir(tmp_path, monke
     job = _make_job(["W4A16_GPTQ"])
     captured = {}
 
-    def capturing_quantize_safetensors(model, tokenizer, format, calibration, output_dir, log_cb, source_dir=None):
+    def capturing_quantize_safetensors(model, tokenizer, format, calibration, output_dir, source_dir, log_cb):
         captured["source_dir"] = source_dir
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
