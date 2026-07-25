@@ -6,6 +6,8 @@ import subprocess
 from pathlib import Path
 from typing import Callable
 
+from b2cq.workers._run import run_streamed
+
 CONVERT_SCRIPT = "/opt/llama.cpp/convert_hf_to_gguf.py"
 PATCH_SCRIPT = "/opt/patch_convert_hf_to_gguf.py"
 
@@ -25,7 +27,8 @@ VERIFY_SCRIPT = (
 
 def is_multimodal(source_dir: Path) -> bool:
     cfg = json.loads((source_dir / "config.json").read_text(encoding="utf-8"))
-    return cfg.get("architectures", [None])[0] == "Mistral3ForConditionalGeneration"
+    architectures = cfg.get("architectures") or []
+    return bool(architectures) and architectures[0] == "Mistral3ForConditionalGeneration"
 
 
 def export_mmproj(source_dir: Path, output_gguf: Path, log_cb: Callable[[str], None]) -> None:
@@ -40,13 +43,7 @@ def export_mmproj(source_dir: Path, output_gguf: Path, log_cb: Callable[[str], N
     output_gguf.parent.mkdir(parents=True, exist_ok=True)
     cmd = ["python3", CONVERT_SCRIPT, str(source_dir), "--mmproj",
            "--outtype", "f16", "--outfile", str(output_gguf)]
-    log_cb(f"$ {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-    for line in proc.stdout:
-        log_cb(line.rstrip())
-    proc.wait()
-    if proc.returncode != 0:
-        raise RuntimeError(f"mmproj export failed with exit {proc.returncode}")
+    run_streamed(cmd, log_cb, "mmproj export")
 
     # 3. Verify v.token_embd.img_break is present.
     verify = subprocess.run(
