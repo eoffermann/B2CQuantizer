@@ -59,3 +59,12 @@ def _load_hf(dataset_id: str, token: str | None) -> list[dict]:
         elif "text" in row:
             out.append({"messages": [{"role": "user", "content": row["text"]}]})
     return out
+
+
+def to_plaintext(samples: list[dict], output_path: Path) -> Path:
+    """Render calibration samples as concatenated plain text for llama-imatrix."""
+    with output_path.open("w", encoding="utf-8") as f:
+        for s in samples:
+            for m in s.get("messages", []):
+                f.write((m.get("content") or "") + "\n\n")
+    return output_path
