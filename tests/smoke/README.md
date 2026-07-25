@@ -71,9 +71,11 @@ detected-multimodal sources, per `SPEC.md` §10) — that's expected for this mo
   or enter an HF dataset ID. This exercises the zero-friction path (`SPEC.md` §8) and keeps the
   smoke run self-contained.
 - Leave **Update source README** at its default (ON) — this is what step 5 verifies.
-- Review the repo-name preview table (should show `<owner>/Mistral-7B-v0.1-Q4_K_M` /
-  `-Q8_0` sharing a single `<owner>/Mistral-7B-v0.1-GGUF` repo, and
-  `<owner>/Mistral-7B-v0.1-W4A16_GPTQ` as its own repo) and Launch.
+- Note the default repo naming convention that will be used (there is no preview
+  table in the UI — this is just what to expect): the two GGUF formats
+  (`Q4_K_M`, `Q8_0`) share a single `<owner>/Mistral-7B-v0.1-GGUF` repo, and the
+  safetensors format lands in its own `<owner>/Mistral-7B-v0.1-W4A16_GPTQ` repo.
+  Then Launch.
 
 This selection deliberately exercises both lanes concurrently (Lane A: one safetensors format;
 Lane B: two GGUF formats sharing one BF16 GGUF intermediate) without pulling in the imatrix

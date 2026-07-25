@@ -7,16 +7,38 @@ existing (streaming tests hang easily under TestClient).
 """
 from __future__ import annotations
 
+from collections import namedtuple
 from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
 import b2cq.web.routes as routes
-from b2cq.job_model import QuantStatus
+from b2cq.calibration import CalibrationSource
+from b2cq.job_model import QuantResult, QuantStatus
 from b2cq.main import app
 
 client = TestClient(app)
+
+_DiskUsage = namedtuple("_DiskUsage", ["total", "used", "free"])
+
+
+@pytest.fixture(autouse=True)
+def _web_test_env(monkeypatch):
+    """Isolate the module-level JobStore between tests and neutralize the disk
+    preflight so it doesn't depend on the host machine's real free space.
+
+    - JobStore isolation keeps the single-job guard (I2) from tripping on a
+      leftover pending/running job created by an earlier test.
+    - disk_usage is stubbed to report plenty of free space so the I3 preflight
+      passes deterministically; individual tests can re-stub it to go low.
+    """
+    routes.JOB_STORE._jobs.clear()
+    monkeypatch.setattr(
+        routes.shutil, "disk_usage",
+        lambda path: _DiskUsage(total=10**13, used=0, free=10**13),
+    )
+    yield
 
 
 def test_health():
@@ -202,3 +224,67 @@ def test_job_stream_route_returns_event_stream():
     matches = [r for r in app.routes if getattr(r, "path", None) == "/jobs/{job_id}/stream"]
     assert len(matches) == 1
     assert "GET" in matches[0].methods
+
+
+def _job_form(**overrides):
+    data = {
+        "source_model": "acme/test-model-7b",
+        "hf_token": "hf_testtoken123",
+        "calibration_type": "bundled",
+        "quants": ["Q4_K_M"],
+        "owner": "acme",
+    }
+    data.update(overrides)
+    files = {"calibration_file": ("cal.jsonl", b"", "application/octet-stream")}
+    return data, files
+
+
+# ---------------------------------------------------------------------------
+# I2: single-job guard -- reject a second submission while one is in flight
+# ---------------------------------------------------------------------------
+
+def test_create_job_rejected_when_another_job_running(monkeypatch):
+    _install_fakes(monkeypatch)
+    # Seed a job that is still running.
+    running = routes.JOB_STORE.create(
+        source_model="acme/other", owner="acme",
+        quants=[QuantResult(quant_id="Q4_K_M", status=QuantStatus.RUNNING, lane="B")],
+        calibration=CalibrationSource(type="bundled"), private=False,
+        update_source_readme=False,
+    )
+    running.status = "running"
+
+    data, files = _job_form()
+    resp = client.post("/jobs", data=data, files=files, follow_redirects=False)
+    assert resp.status_code == 409
+    assert running.id in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# I3: disk preflight -- refuse when free space is below the threshold
+# ---------------------------------------------------------------------------
+
+def test_create_job_rejected_when_disk_below_threshold(monkeypatch):
+    _install_fakes(monkeypatch)
+    # Only ~10 GB free, well under the 150 GB requirement.
+    monkeypatch.setattr(
+        routes.shutil, "disk_usage",
+        lambda path: _DiskUsage(total=200 * 10**9, used=190 * 10**9, free=10 * 10**9),
+    )
+    data, files = _job_form()
+    resp = client.post("/jobs", data=data, files=files, follow_redirects=False)
+    assert resp.status_code == 400
+    assert "Insufficient disk" in resp.json()["detail"]
+
+
+def test_create_job_proceeds_when_disk_sufficient(monkeypatch):
+    _install_fakes(monkeypatch)
+    # Plenty of free space (the autouse fixture already stubs this, but assert
+    # the happy path explicitly as the other half of the both-ways I3 check).
+    monkeypatch.setattr(
+        routes.shutil, "disk_usage",
+        lambda path: _DiskUsage(total=500 * 10**9, used=0, free=500 * 10**9),
+    )
+    data, files = _job_form()
+    resp = client.post("/jobs", data=data, files=files, follow_redirects=False)
+    assert resp.status_code == 303

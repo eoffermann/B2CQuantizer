@@ -27,6 +27,10 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 JOB_STORE = JobStore()
 PROGRESS = ProgressBus()
 
+# Minimum free disk required at job launch (I3 / PLAN.md: <150 GB free -> refuse).
+# PLAN.md states the threshold in GB, so this is 150 * 10**9 bytes.
+MIN_FREE_DISK_BYTES = 150 * 10**9
+
 
 @lru_cache(maxsize=1)
 def _blackwell_available() -> bool:
@@ -68,9 +72,29 @@ async def create_job(
     private: bool = Form(False),
     update_source_readme: bool = Form(False),
 ):
+    # Single-job guard (I2): this app runs one job at a time on a single pod.
+    # Reject a new submission while any prior job is still pending/running.
+    for existing in JOB_STORE.list():
+        if existing.status in ("pending", "running"):
+            raise HTTPException(
+                status_code=409,
+                detail=(f"A job ({existing.id}) is already {existing.status}; "
+                        "only one job may run at a time. Wait for it to finish."),
+            )
+
     # Build calibration source
     workdir = Path(mkdtemp(prefix="b2cq_"))
     try:
+        # Disk preflight (I3): refuse before any download-heavy work if the
+        # pod doesn't have enough free space for a 24B source + intermediates.
+        free = shutil.disk_usage(workdir).free
+        if free < MIN_FREE_DISK_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=(f"Insufficient disk: {free / 10**9:.1f} GB free, "
+                        f"{MIN_FREE_DISK_BYTES / 10**9:.0f} GB required."),
+            )
+
         if calibration_type == "upload" and calibration_file is not None:
             cal_path = workdir / "cal.jsonl"
             cal_path.write_bytes(await calibration_file.read())
@@ -81,12 +105,14 @@ async def create_job(
         else:
             cal_source = CalibrationSource(type="bundled")
 
-        calibration = load_calibration(cal_source)
+        # load_calibration and whoami both do blocking I/O (file/dataset read,
+        # network round-trip); offload them so the event loop isn't blocked (I8).
+        calibration = await asyncio.to_thread(load_calibration, cal_source)
 
         # Resolve owner from token if not supplied
         hf_client = HFClient(token=hf_token)
         if not owner:
-            owner = hf_client.whoami().get("name", "unknown")
+            owner = (await asyncio.to_thread(hf_client.whoami)).get("name", "unknown")
 
         # Build quant results
         quant_results = []

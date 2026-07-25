@@ -3,8 +3,9 @@
 <head>
     <meta charset="utf-8">
     <title>{% block title %}B2CQuantizer{% endblock %}</title>
-    <script src="https://unpkg.com/htmx.org@2.0.3"></script>
-    <script src="https://unpkg.com/htmx.org@2.0.3/dist/ext/sse.js"></script>
+    <!-- htmx (and its SSE extension) removed: no page uses hx-* attributes,
+         and the live job view consumes SSE via a native EventSource in
+         job.html's Alpine init() instead of the htmx SSE extension. -->
     <script defer src="https://unpkg.com/alpinejs@3.14.1/dist/cdn.min.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
 </head>

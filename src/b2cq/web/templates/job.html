@@ -1,9 +1,13 @@
 {% extends "base.html" %}
 {% block body %}
-<div x-data="jobView()" hx-ext="sse" sse-connect="/jobs/{{ job.id }}/stream">
+<div x-data="jobView()">
     <h1 class="text-2xl font-semibold">Job {{ job.id }}</h1>
     <p class="text-slate-600">Source: {{ job.source_model }} · Owner: {{ job.owner }}</p>
     <p x-text="'Status: ' + jobStatus" class="mt-2 font-medium"></p>
+
+    <ul class="mt-2 text-sm text-red-700 list-disc pl-5" x-show="warnings.length">
+        <template x-for="w in warnings" :key="w"><li x-text="w"></li></template>
+    </ul>
 
     <table class="mt-6 w-full text-sm">
         <thead class="text-left border-b">
@@ -53,10 +57,14 @@ function jobView() {
         },
         laneA: '',
         laneB: '',
+        warnings: [],
         init() {
             const knownLane = { {% for q in job.quants %}'{{ q.quant_id }}': '{{ q.lane }}'{% if not loop.last %},{% endif %}{% endfor %} };
-            this.$el.addEventListener('htmx:sseMessage', (e) => {
-                const evt = JSON.parse(e.detail.data);
+            // Consume the SSE stream directly with a native EventSource. Each
+            // event's payload is the JSON object published by the ProgressBus.
+            const es = new EventSource('/jobs/{{ job.id }}/stream');
+            es.onmessage = (e) => {
+                const evt = JSON.parse(e.data);
                 if (evt.type === 'status') {
                     this.statuses[evt.quant] = evt.status;
                     if (evt.elapsed !== undefined) this.elapsed[evt.quant] = evt.elapsed;
@@ -64,12 +72,20 @@ function jobView() {
                     const lane = knownLane[evt.quant] || (evt.quant.includes('lane_a') ? 'A' : 'B');
                     if (lane === 'A') this.laneA = (this.laneA + '\n[' + evt.quant + '] ' + evt.line).slice(-8000);
                     else this.laneB = (this.laneB + '\n[' + evt.quant + '] ' + evt.line).slice(-8000);
+                } else if (evt.type === 'lane_failed') {
+                    this.warnings.push('Lane ' + evt.lane + ' setup failed: ' + evt.error);
+                } else if (evt.type === 'readme_failed') {
+                    this.warnings.push('Source README update failed: ' + evt.error);
                 } else if (evt.type === 'job_complete') {
                     this.jobStatus = 'complete';
+                    es.close();
                 } else if (evt.type === 'job_failed') {
                     this.jobStatus = 'failed: ' + evt.error;
+                    this.warnings.push('Job failed: ' + evt.error);
+                    es.close();
                 }
-            });
+                // evt.type === 'job_started' is intentionally ignored.
+            };
         }
     };
 }

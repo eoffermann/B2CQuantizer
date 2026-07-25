@@ -9,6 +9,8 @@ llama.cpp required.
 """
 from __future__ import annotations
 
+import json
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -21,6 +23,7 @@ from b2cq.hf_client import HFClient
 from b2cq.job_model import Job, QuantResult, QuantStatus
 from b2cq.job_runner import run_job
 from b2cq.quant_catalog import get as get_quant, QuantFamily
+from b2cq.workers.safetensors import _MULTIMODAL_ARCH, _TEXT_ARCH
 
 
 # ---------------------------------------------------------------------------
@@ -62,11 +65,22 @@ def _make_job(quant_ids, *, owner="acme", source_model="acme/model-7b",
     )
 
 
-def _make_hf_client() -> MagicMock:
+def _make_hf_client(arch: str = "MistralForCausalLM") -> MagicMock:
     hf_client = MagicMock(spec=HFClient)
     hf_client.download_snapshot.return_value = Path("/fake/source")
     hf_client.upload_folder.return_value = "https://huggingface.co/repo/commit/abc"
     hf_client.upload_file.return_value = "https://huggingface.co/repo/blob/main/file.gguf"
+
+    # I4: run_job now fetches config.json via download_file before downloading
+    # the source snapshot, to refuse non-Mistral architectures. Return a real
+    # on-disk config.json carrying `arch` so the arch guard can parse it.
+    def _download_file(repo_id, filename):
+        fd, path = tempfile.mkstemp(suffix="_config.json")
+        p = Path(path)
+        p.write_text(json.dumps({"architectures": [arch]}), encoding="utf-8")
+        return p
+
+    hf_client.download_file.side_effect = _download_file
     return hf_client
 
 
@@ -352,3 +366,143 @@ async def test_repo_id_overrides_honored_per_lane(tmp_path, monkeypatch):
     assert statuses["W4A16_GPTQ"].repo_id == "acme/model-7b-W4A16_GPTQ"
     upload_folder_repo_ids = [call.args[0] for call in hf_client.upload_folder.call_args_list]
     assert "acme/model-7b-W4A16_GPTQ" in upload_folder_repo_ids
+
+
+# ---------------------------------------------------------------------------
+# C2: the job workdir (source snapshot etc.) is always deleted at job end
+# ---------------------------------------------------------------------------
+
+async def test_workdir_removed_after_success(tmp_path, monkeypatch):
+    job = _make_job(["Q4_K_M"])
+    _patch_workers(monkeypatch)
+    hf_client = _make_hf_client()
+    progress = RecordingProgress()
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    await run_job(job, hf_client, CALIBRATION, progress, workdir)
+
+    assert job.status == "complete"
+    assert not workdir.exists()
+
+
+async def test_workdir_removed_after_failure(tmp_path, monkeypatch):
+    job = _make_job(["Q4_K_M"])
+    _patch_workers(monkeypatch)
+    hf_client = _make_hf_client()
+    hf_client.download_snapshot.side_effect = RuntimeError("network is down")
+    progress = RecordingProgress()
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    await run_job(job, hf_client, CALIBRATION, progress, workdir)
+
+    assert job.status == "failed"
+    assert not workdir.exists()
+
+
+# ---------------------------------------------------------------------------
+# I4: launch-time architecture refusal (only Mistral / Mistral3 allowed)
+# ---------------------------------------------------------------------------
+
+async def test_non_mistral_arch_refused_before_source_download(tmp_path, monkeypatch):
+    job = _make_job(["Q4_K_M"])
+    _patch_workers(monkeypatch)
+    hf_client = _make_hf_client(arch="LlamaForCausalLM")
+    progress = RecordingProgress()
+
+    await run_job(job, hf_client, CALIBRATION, progress, tmp_path)
+
+    assert job.status == "failed"
+    # The expensive source download must never have started.
+    hf_client.download_snapshot.assert_not_called()
+    failed = progress.of_type("job_failed")
+    assert failed and "Unsupported architecture" in failed[0]["error"]
+
+
+@pytest.mark.parametrize("arch", [_TEXT_ARCH, _MULTIMODAL_ARCH])
+async def test_mistral_archs_proceed_past_guard(tmp_path, monkeypatch, arch):
+    job = _make_job(["Q4_K_M"])
+    _patch_workers(monkeypatch)
+    hf_client = _make_hf_client(arch=arch)
+    progress = RecordingProgress()
+
+    await run_job(job, hf_client, CALIBRATION, progress, tmp_path)
+
+    assert job.status == "complete"
+    hf_client.download_snapshot.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# I5: full per-quant logs are written to LOG_ROOT/<job_id>/<quant>.log
+# ---------------------------------------------------------------------------
+
+async def test_per_quant_log_files_written(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_runner_module, "LOG_ROOT", tmp_path / "logs")
+    job = _make_job(["Q4_K_M"])
+
+    def logging_gguf_quantize(bf16_gguf, output_gguf, format, log_cb, imatrix=None):
+        log_cb("hello from the quant worker")
+        output_gguf = Path(output_gguf)
+        output_gguf.parent.mkdir(parents=True, exist_ok=True)
+        output_gguf.write_bytes(b"data")
+
+    _patch_workers(monkeypatch, gguf_quantize=logging_gguf_quantize)
+    hf_client = _make_hf_client()
+    progress = RecordingProgress()
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    await run_job(job, hf_client, CALIBRATION, progress, workdir)
+
+    log_file = tmp_path / "logs" / job.id / "Q4_K_M.log"
+    assert log_file.exists()
+    assert "hello from the quant worker" in log_file.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# I6: hf uploads are retried with backoff (3 attempts) before giving up
+# ---------------------------------------------------------------------------
+
+async def test_upload_retries_then_succeeds(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_runner_module, "UPLOAD_BACKOFF_BASE", 0)  # no real sleeps
+    job = _make_job(["Q4_K_M"])
+    _patch_workers(monkeypatch)
+    hf_client = _make_hf_client()
+
+    calls = {"n": 0}
+
+    def flaky_upload_file(repo_id, file_path, path_in_repo, **kwargs):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError("transient network blip")
+        return "https://huggingface.co/repo/blob/main/file.gguf"
+
+    hf_client.upload_file.side_effect = flaky_upload_file
+    progress = RecordingProgress()
+
+    await run_job(job, hf_client, CALIBRATION, progress, tmp_path)
+
+    assert _status_map(job)["Q4_K_M"].status == QuantStatus.DONE
+    assert calls["n"] == 3  # failed twice, succeeded on the third attempt
+
+
+async def test_upload_fails_after_max_attempts(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_runner_module, "UPLOAD_BACKOFF_BASE", 0)
+    job = _make_job(["Q4_K_M"])
+    _patch_workers(monkeypatch)
+    hf_client = _make_hf_client()
+
+    calls = {"n": 0}
+
+    def always_fail(repo_id, file_path, path_in_repo, **kwargs):
+        calls["n"] += 1
+        raise RuntimeError("network stays down")
+
+    hf_client.upload_file.side_effect = always_fail
+    progress = RecordingProgress()
+
+    await run_job(job, hf_client, CALIBRATION, progress, tmp_path)
+
+    assert _status_map(job)["Q4_K_M"].status == QuantStatus.FAILED
+    assert calls["n"] == 3  # exactly UPLOAD_MAX_ATTEMPTS attempts
