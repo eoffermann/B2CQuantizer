@@ -132,7 +132,7 @@ kernels for the current device.
 
 **Cause:** NVFP4 requires Blackwell tensor cores (compute capability SM ≥ 12.0) — it is not
 supported on Hopper (H100) or Ampere (A100) GPUs at all (`SPEC.md` §4, §7). The UI is meant to gray
-out the NVFP4 checkbox when it detects `torch.cuda.get_device_properties(0).major < 12`, so hitting
+out the NVFP4 checkbox when it detects `torch.cuda.get_device_properties(0).major < 12` (per `PLAN.md` Global Constraints), so hitting
 this failure usually means one of:
 - The job was launched on a pod whose GPU changed after the UI's detection ran (unlikely, but
   possible with certain RunPod pod-swap flows).

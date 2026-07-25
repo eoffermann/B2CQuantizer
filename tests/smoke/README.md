@@ -13,7 +13,7 @@ Run this:
   particularly the mmproj patch issue, to confirm the fix actually applies at runtime.
 
 For automated GPU-dependent tests that run as part of the normal test suite (opt-in, smaller in
-scope than this procedure), see `tests/integration/` — set `GPU_INTEGRATION=1` to enable them.
+scope than this procedure), see `tests/integration/` — set `GPU_INTEGRATION=1` to enable them (per `PLAN.md` Task 7).
 This smoke procedure is the broader, real-world complement to those.
 
 ## Prerequisites
@@ -45,7 +45,7 @@ Sanity-check the pod is healthy before proceeding:
 ```bash
 curl -sSf https://<your-pod-proxy-url>/health
 ```
-Expected: `{"status":"ok"}`.
+Expected: `{"status":"ok"}` (per `PLAN.md` Task 2, FastAPI stub).
 
 ### 2. Point at a public small Mistral model
 
@@ -123,7 +123,7 @@ Confirm the outputs aren't just present on the Hub but actually load in their ta
 MODEL_NAME=<owner>/Mistral-7B-v0.1-W4A16_GPTQ vllm serve "$MODEL_NAME" --max-model-len 4096
 ```
 Expected: vLLM loads the model and starts serving without erroring on the quantized weights/config
-(GPTQ Marlin kernel path per `SPEC.md` §7 notes). A successful health check / one completion
+(GPTQ Marlin kernel path per `PLAN.md` Task 3, quant catalog). A successful health check / one completion
 request against the running server is sufficient — you don't need a full benchmark.
 
 **llama.cpp smoke** (GGUF quants):
