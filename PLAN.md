@@ -30,9 +30,12 @@
   - `python-multipart==0.0.20` (for form uploads)
   - `jinja2==3.1.*`
   - `pydantic==2.9.*`
+  - `mistral-common==1.11.5` (EXACT pin; see FrndoBrain-class invariants below)
   - `pytest==8.3.*`
   - `pytest-asyncio==0.24.*`
 - **llama.cpp version:** build a specific commit into the image; anchor commit SHA after first successful build. Recommend a recent tag (e.g., `b4200` or newer) that supports Mistral3 conversion. Note the two upstream bugs in `MmprojModel.filter_tensors` and pixtral activation flag documented in the `patch_convert_hf_to_gguf.py` section of Task 8 — the plan includes a runtime patch script instead of a fork.
+- **mistral-common pin (FrndoBrain-class artifacts only):** `mistral-common == 1.11.5`, added to `pyproject.toml`. This matches the FrndoBrain serving stack; the private attribute `_message_position_to_encode_tools_settings` on `InstructTokenizerV11` is version-fragile (it was `_user_message_position_to_encode_tools` in 1.9.x). The safetensors worker MUST hard-fail on version mismatch AND on attribute-missing (see SPEC §14). The GGUF path does NOT use mistral-common and is unaffected.
+- **FrndoBrain-class artifact detection is automatic** via presence of `tekken.json` in the source model repo (see SPEC §14). If detected, the safetensors calibration pass renders through mistral-common with the tool-placement attribute flip; otherwise it uses HF `apply_chat_template` as a fallback for generic Mistral models.
 
 ## Repository layout
 
@@ -1186,12 +1189,12 @@ git commit -m "feat: progress bus (async pub/sub) + job model + in-memory store"
 - Create: `tests/integration/test_safetensors_worker.py`
 
 **Interfaces:**
-- Consumes: `llm-compressor`, `transformers`, `torch`; calibration data (list of message dicts); source model (already downloaded on disk); a `QuantSpec` with format in `{W4A16_GPTQ, W4A16_AWQ, NVFP4, FP8_E4M3, FP8_E5M2}`
+- Consumes: `llm-compressor`, `transformers`, `torch`, `mistral-common` (pinned per Global Constraints); calibration data (list of message dicts, optionally with tools per entry); source model (already downloaded on disk); a `QuantSpec` with format in `{W4A16_GPTQ, W4A16_AWQ, NVFP4, FP8_E4M3, FP8_E5M2}`
 - Produces:
-  - `def quantize_safetensors(source_dir: Path, format: str, calibration: list[dict], output_dir: Path, log_cb: Callable[[str], None]) -> None`
-  - Loads model ONCE per lane; the caller keeps the loaded model across formats — worker receives the loaded model as a keyword arg. Signature:
-  - `def quantize_safetensors(model, tokenizer, format: str, calibration: list[dict], output_dir: Path, log_cb) -> None`
-  - Also: `def load_model_for_safetensors(source_dir: Path, log_cb) -> tuple[model, tokenizer]` — separate helper so Lane A can call it once and pass the result into each per-format quantize call.
+  - `def quantize_safetensors(model, tokenizer, format: str, calibration: list[dict], output_dir: Path, source_dir: Path, log_cb) -> None` — Loads model ONCE per lane; the caller keeps the loaded model across formats. `source_dir` is required so the worker can detect FrndoBrain-class artifacts (tekken.json presence) and pick the right calibration render path per SPEC §14.
+  - `def load_model_for_safetensors(source_dir: Path, log_cb) -> tuple[model, tokenizer]` — separate helper so Lane A can call it once and pass the result into each per-format quantize call.
+  - `def is_frndobrain_class(source_dir: Path) -> bool` — detection helper.
+  - `def build_frndobrain_tokenizer(source_dir: Path) -> MistralTokenizer` — pinned + version-checked + attribute-flip-applied.
 
 **Critical Mistral3 handling** (do NOT skip these — they are the reason your existing `frndobrain_quantize.py` works):
 
@@ -1380,19 +1383,106 @@ def _build_recipe(format: str, arch: str, model):
     raise ValueError(f"unsupported safetensors format: {format!r}")
 
 
+def is_frndobrain_class(source_dir: Path) -> bool:
+    """Detect FrndoBrain-class artifact by presence of tekken.json in source.
+
+    FrndoBrain merges carry tekken.json byte-identical to the base Mistral repo
+    per the tokenizer-invariant training contract. Its presence marks an artifact
+    whose calibration MUST go through mistral-common with the tool-placement flip.
+    See SPEC §14 for the full invariant set.
+    """
+    return (source_dir / "tekken.json").exists()
+
+
+# Pin locked to what the FrndoBrain serving stack ships. The private attribute
+# below is version-fragile — it was `_user_message_position_to_encode_tools` in
+# mistral-common 1.9.x and renamed to `_message_position_to_encode_tools_settings`
+# in 1.11.x. Silent divergence between calibration-time and serving-time
+# tokenization gets baked into the quantized weights; hence the hard-fails.
+_EXPECTED_MISTRAL_COMMON = "1.11.5"
+_TOOL_PLACEMENT_ATTR = "_message_position_to_encode_tools_settings"
+
+
+def build_frndobrain_tokenizer(source_dir: Path):
+    """Build a mistral-common MistralTokenizer with the tools-at-first-user-turn
+    flip, pinned to the version the serving stack ships. Fails loudly if
+    version or attribute has drifted."""
+    import mistral_common
+    from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+    from mistral_common.tokens.tokenizers.base import UserMessagePosition
+    from mistral_common.protocol.instruct.validator import ValidationMode
+
+    if mistral_common.__version__ != _EXPECTED_MISTRAL_COMMON:
+        raise RuntimeError(
+            f"mistral-common version mismatch: got {mistral_common.__version__}, "
+            f"expected {_EXPECTED_MISTRAL_COMMON}. FrndoBrain-class calibration "
+            "is version-locked to match training + serving; audit the InstructTokenizer "
+            "source and update the pin (see SPEC §14 for the drift history)."
+        )
+    # Load from the local source_dir (tekken.json lives here).
+    tok = MistralTokenizer.from_file(str(source_dir / "tekken.json"),
+                                      mode=ValidationMode.finetuning)
+    it = tok.instruct_tokenizer
+    if not hasattr(it, _TOOL_PLACEMENT_ATTR):
+        raise RuntimeError(
+            f"expected attribute {_TOOL_PLACEMENT_ATTR!r} not present on "
+            f"{type(it).__name__}; attribute has moved again — audit InstructTokenizer "
+            "source and update the pin."
+        )
+    setattr(it, _TOOL_PLACEMENT_ATTR, UserMessagePosition.first)
+    return tok
+
+
+def _render_calibration_frndobrain(mtok, sample: dict) -> str:
+    """Render one calibration sample via mistral-common. Sample shape is
+    {messages: [...], tools: [...] or omitted}. Returns plain text — llm-compressor
+    will re-tokenize with the model's HF tokenizer, which for FrndoBrain artifacts
+    produces the same IDs since tokenizer.json is regenerated from tekken.json
+    at training time. What matters is the CONVERSATION STRUCTURE is rendered by
+    mistral-common (so [AVAILABLE_TOOLS] lands at first user turn, tool_calls
+    render with V11's [CALL_ID] format, etc.)."""
+    from mistral_common.protocol.instruct.request import ChatCompletionRequest
+    req = ChatCompletionRequest(messages=sample["messages"], tools=sample.get("tools"))
+    return mtok.encode_chat_completion(req).text
+
+
+def _render_calibration_hf(tokenizer, sample: dict) -> str:
+    """Fallback render for non-FrndoBrain Mistral models. Uses HF chat template."""
+    return tokenizer.apply_chat_template(sample["messages"], tokenize=False)
+
+
 def quantize_safetensors(model, tokenizer, format: str, calibration: list[dict],
-                         output_dir: Path, log_cb: Callable[[str], None]) -> None:
+                         output_dir: Path, source_dir: Path,
+                         log_cb: Callable[[str], None]) -> None:
     from llmcompressor.transformers import oneshot
 
     arch = model.config.architectures[0]
     recipe = _build_recipe(format, arch, model)
 
-    # Tokenize calibration
-    log_cb(f"Preparing {len(calibration)} calibration samples")
-    def render(sample):
-        return tokenizer.apply_chat_template(sample["messages"], tokenize=False)
-    texts = [render(s) for s in calibration]
+    # Detect artifact class and pick the calibration render path.
+    if is_frndobrain_class(source_dir):
+        log_cb(f"FrndoBrain-class artifact detected (tekken.json present in {source_dir})")
+        log_cb("Calibration rendering via mistral-common with tools-at-first-user-turn flip")
+        mtok = build_frndobrain_tokenizer(source_dir)
+        # If ANY calibration sample fails validation (e.g., non-assistant-terminated),
+        # fail loudly — the user's calibration corpus does not match the training
+        # invariant and would produce calibration/inference divergence.
+        try:
+            texts = [_render_calibration_frndobrain(mtok, s) for s in calibration]
+        except Exception as e:
+            raise RuntimeError(
+                f"FrndoBrain-class calibration failed to render at least one sample "
+                f"via mistral-common: {type(e).__name__}: {e}. This means your "
+                "calibration corpus does not match the training/serving invariant. "
+                "For best results, calibrate on the same data (or a same-shape subset) "
+                "as was used for training. See SPEC §14 for the invariants that must hold."
+            ) from e
+    else:
+        log_cb(f"Generic Mistral artifact (no tekken.json in {source_dir})")
+        log_cb("Calibration rendering via HF chat template")
+        texts = [_render_calibration_hf(tokenizer, s) for s in calibration]
 
+    log_cb(f"Prepared {len(texts)} calibration samples for {format}")
     log_cb(f"Starting oneshot quantization: {format}")
     oneshot(
         model=model,
@@ -1403,19 +1493,19 @@ def quantize_safetensors(model, tokenizer, format: str, calibration: list[dict],
         max_seq_length=2048,
     )
 
-    # Copy Mistral-native tokenizer artifacts if present
+    # Carry forward Mistral-native tokenizer artifacts if present. llm-compressor
+    # doesn't propagate these; downstream vLLM serving needs them for FrndoBrain.
     from shutil import copy
-    # NOTE: source_dir isn't available here; caller must pass it or we retrieve from model.name_or_path
-    source = Path(model.config._name_or_path) if hasattr(model.config, "_name_or_path") else None
-    if source and source.exists():
-        for name in ("tekken.json", "params.json", "chat_template.jinja"):
-            src = source / name
-            if src.exists():
-                copy(src, output_dir / name)
-                log_cb(f"Carried forward {name}")
+    for name in ("tekken.json", "params.json", "chat_template.jinja"):
+        src = source_dir / name
+        if src.exists():
+            copy(src, output_dir / name)
+            log_cb(f"Carried forward {name}")
 
     log_cb(f"Wrote {format} quant to {output_dir}")
 ```
+
+Note: the caller (Lane A in the orchestrator, Task 10) MUST pass `source_dir` — the local path to the downloaded source model — into `quantize_safetensors`. The signature change from the earlier draft is intentional: source_dir is where we detect FrndoBrain-class-ness and where we pull tekken.json from for the calibration tokenizer. Update the Task 10 call site accordingly.
 
 - [ ] **Step 3: Verify locally**
 
@@ -1761,10 +1851,10 @@ async def _run_lane_a(job: Job, source_dir: Path, calibration, hf_client, progre
         return
 
     for q in safetensors_quants:
-        await _run_one_safetensors_quant(job, q, model, tokenizer, calibration, hf_client, progress, workdir)
+        await _run_one_safetensors_quant(job, q, model, tokenizer, calibration, hf_client, progress, workdir, source_dir)
 
 
-async def _run_one_safetensors_quant(job, q, model, tokenizer, calibration, hf_client, progress, workdir):
+async def _run_one_safetensors_quant(job, q, model, tokenizer, calibration, hf_client, progress, workdir, source_dir):
     q.status = QuantStatus.RUNNING
     q.started_at = datetime.now(timezone.utc)
     t0 = time.time()
@@ -1774,9 +1864,12 @@ async def _run_one_safetensors_quant(job, q, model, tokenizer, calibration, hf_c
 
     try:
         output_dir = workdir / f"safetensors_{q.quant_id}"
+        # Note: source_dir is passed through so quantize_safetensors can detect
+        # FrndoBrain-class artifacts (by tekken.json presence) and pick the right
+        # calibration render path. See SPEC §14 and Task 7 for the rationale.
         await asyncio.to_thread(
             quantize_safetensors,
-            model, tokenizer, get_quant(q.quant_id).format, calibration, output_dir, log_cb,
+            model, tokenizer, get_quant(q.quant_id).format, calibration, output_dir, source_dir, log_cb,
         )
         q.status = QuantStatus.UPLOADING
         await progress.publish(job.id, {"type": "status", "quant": q.quant_id, "status": q.status})
@@ -2530,6 +2623,7 @@ git commit -m "docs: deployment, troubleshooting, smoke procedure"
 - §11 failure handling → Task 10 (orchestrator per-quant/per-lane isolation)
 - §12 security → Task 4 (in-memory token, close-wipes semantics)
 - §13 observability → Task 10 (progress bus + bounded log tails); log-to-disk left as an inline concern of the workers, noted in Task 14 smoke doc.
+- §14 FrndoBrain-class invariants → Task 7 (safetensors worker: `is_frndobrain_class`, `build_frndobrain_tokenizer`, `_render_calibration_frndobrain` — mistral-common pin, attribute flip, hard-fails) + Task 10 (orchestrator passes source_dir through to quantize_safetensors) + Global Constraints (mistral-common pin declared).
 
 **Placeholder scan:** none. Every module has code, every command has expected output, no "TBD"s.
 
@@ -2538,6 +2632,7 @@ git commit -m "docs: deployment, troubleshooting, smoke procedure"
 - `HFClient.close()` semantics consistent between Task 4 (definition) and Task 10 (called in `run_job` finally block).
 - `CalibrationSource` schema consistent across Tasks 5, 10, 12.
 - `run_job` signature `(Job, HFClient, calibration, ProgressBus, workdir)` consistent between Task 10 and Task 12 (routes.py invocation).
+- `quantize_safetensors(model, tokenizer, format, calibration, output_dir, source_dir, log_cb)` — signature (with `source_dir` as second-to-last positional) consistent between Task 7's Interfaces block, its implementation code block, and Task 10's `_run_one_safetensors_quant` call site.
 
 **Scope:** single spec, single implementation. No sub-project decomposition needed.
 

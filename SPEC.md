@@ -187,7 +187,50 @@ The chosen calibration source feeds both Lane A (llm-compressor) and Lane B's im
 - Every job's per-quant logs held in-memory during the job (last N lines per quant, ~50 KB per quant). Full logs saved to `/workspace/logs/<job_id>/<quant>.log` on the pod so they can be `docker cp`'d out if desired.
 - No external log shipping. No metrics endpoint. Pod-local only.
 
-## 14. Explicitly deferred to v2 or later
+## 14. Invariants for FrndoBrain-class artifacts (safetensors calibration must-hold)
+
+FrndoBrain — and any similarly-produced tokenizer-invariant Mistral fine-tune — commits to three training-pipeline invariants at training and serving time. **All three must ALSO be honored during safetensors calibration** because llm-compressor's calibration pass tokenizes the calibration corpus and feeds it forward, and any divergence between calibration-time tokenization and serving-time tokenization gets baked into the quantized weights.
+
+Ignoring any one produces a quant whose calibration distribution differs from what the served model will see at inference. Observed failure mode from the operator's previous run (`run-004`): calibration in a different token dialect than the deployed model → quantized model with degraded tool-calling behavior even though pre-quant BF16 worked correctly.
+
+### The three invariants
+
+1. **mistral-common as sole conversation renderer.** Conversations render via `mistral-common`'s Tekken tokenizer (`MistralTokenizer.encode_chat_completion`), NEVER via HF chat template (`AutoTokenizer.apply_chat_template`). Applies to training AND to calibration. The HF path renders a `[AVAILABLE_TOOLS]…[/AVAILABLE_TOOLS]` block in a subtly different shape than mistral-common, and even a byte-level difference propagates into activation stats → into calibrated weights.
+
+2. **Tool block at first user turn (not last).** mistral-common's `InstructTokenizerV11` — what Mistral-Small-3.2-24B ships with — defaults to placing `[AVAILABLE_TOOLS]` on the LAST user turn. FrndoBrain training and serving flip this to the FIRST user turn (right after `[/SYSTEM_PROMPT]`), which enables prefix caching and matches what mistral-common's newer V13 tokenizer ships as default. The flip is a one-line attribute assignment on the returned tokenizer instance:
+   ```python
+   from mistral_common.tokens.tokenizers.base import UserMessagePosition
+   tok.instruct_tokenizer._message_position_to_encode_tools_settings = UserMessagePosition.first
+   ```
+
+3. **Tool-array composition.** Every conversation's `tools` array is a random 6-12 sample from the full production tool pool spanning ≥2 categories, always preserving the actually-called subset. This is a training-time preprocessing step; if the calibration corpus IS the training corpus (or a subset of it), this is already baked in and no further action is needed at calibration time.
+
+### Version pinning
+
+**`mistral-common == 1.11.5`** — the version the FrndoBrain serving stack ships. Attribute-name drift is a real risk: this attribute was `_user_message_position_to_encode_tools` in mistral-common 1.9.x and renamed to `_message_position_to_encode_tools_settings` in 1.11.x. Silently coercing across versions produces the exact failure mode this section exists to prevent.
+
+The safetensors worker MUST hard-fail on:
+- Wrong `mistral-common.__version__`
+- Attribute `_message_position_to_encode_tools_settings` not present on the target tokenizer
+
+Any future version bump requires re-verifying the attribute name via `dir(tok.instruct_tokenizer)` AND empirically confirming the flip still moves the `[AVAILABLE_TOOLS]` block between first and last user turn.
+
+### Detection
+
+FrndoBrain-class artifacts are recognized by presence of `tekken.json` in the source model repo (all FrndoBrain merges carry it byte-identical to the base Mistral repo per the tokenizer-invariant training contract). Detection is automatic — no UI toggle.
+
+- `tekken.json` present in source repo → **FrndoBrain-class**; enforce all three invariants during calibration.
+- `tekken.json` absent → generic Mistral or unmodified base model; calibrate via standard HF chat template.
+
+An advanced-mode UI override can be added in a later iteration if a user needs to force one path or the other.
+
+### GGUF path — unaffected
+
+llama.cpp's `convert_hf_to_gguf.py` uses its own tokenizer converted from HF `tokenizer.json`; mistral-common is not in the loop for GGUF quantization or for imatrix computation (imatrix uses raw calibration text passed through llama.cpp's tokenizer). GGUF quants — K-quants, I-quants, misc — do not need any of the three invariants applied. Only the safetensors quant path is affected.
+
+---
+
+## 15. Explicitly deferred to v2 or later
 
 - Non-Mistral architectures.
 - EXL2 quants.
