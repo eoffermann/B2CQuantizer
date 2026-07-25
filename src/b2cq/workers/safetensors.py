@@ -137,6 +137,11 @@ def _build_awq_mappings_scoped(model):
 
 
 def _build_recipe(format: str, arch: str, model):
+    if arch not in (_MULTIMODAL_ARCH, _TEXT_ARCH):
+        raise ValueError(
+            f"Unsupported architecture: {arch!r}. B2CQuantizer v1 supports only Mistral/Mistral3."
+        )
+
     from llmcompressor.modifiers.quantization import QuantizationModifier
     from llmcompressor.modifiers.quantization.gptq import GPTQModifier
     from llmcompressor.modifiers.transform.awq import AWQModifier
@@ -199,7 +204,12 @@ def _build_recipe(format: str, arch: str, model):
     raise ValueError(f"unsupported safetensors format: {format!r}")
 
 
-def _render_calibration_texts(samples: list[dict], tokenizer, source_dir: Path | None) -> list[str]:
+def _render_calibration_texts(
+    samples: list[dict],
+    tokenizer,
+    source_dir: Path | None,
+    log_cb: Callable[[str], None],
+) -> list[str]:
     """Render `{"messages": [...]}` calibration samples to text for oneshot.
 
     FrndoBrain-style Mistral artifacts ship a native `tekken.json` tokenizer
@@ -221,9 +231,16 @@ def _render_calibration_texts(samples: list[dict], tokenizer, source_dir: Path |
                     request = ChatCompletionRequest(messages=sample["messages"])
                     tokenized = mc_tokenizer.encode_chat_completion(request)
                     texts.append(tokenized.text)
+                log_cb("Rendered calibration text via mistral-common (tekken.json tokenizer)")
                 return texts
-            except ImportError:
-                pass  # mistral-common not installed; fall back to transformers below
+            except ImportError as e:
+                # mistral-common not installed, or the import path guessed above
+                # doesn't match the installed version; fall back to transformers
+                # below, but make the fallback visible instead of silent.
+                log_cb(
+                    f"mistral-common unavailable ({e}); falling back to transformers "
+                    "chat template for calibration"
+                )
 
     return [tokenizer.apply_chat_template(sample["messages"], tokenize=False) for sample in samples]
 
@@ -250,10 +267,17 @@ def quantize_safetensors(
     `from_pretrained` recorded the model as having been loaded from -- which
     is best-effort and may be `None`/stale for models loaded in unusual ways.
     """
-    from llmcompressor.transformers import oneshot
+    if not calibration:
+        raise ValueError("calibration is empty")
 
     arch = model.config.architectures[0]
+    # _build_recipe validates `arch` against the supported set before doing
+    # any of its own heavy imports, so this raises ValueError early (and
+    # cheaply) for an unsupported architecture rather than failing deep
+    # inside llm-compressor after calibration rendering / model prep.
     recipe = _build_recipe(format, arch, model)
+
+    from llmcompressor.transformers import oneshot
 
     if source_dir is None:
         name_or_path = getattr(model.config, "_name_or_path", None)
@@ -266,7 +290,7 @@ def quantize_safetensors(
         f"Preparing {len(samples)} calibration samples "
         f"(of {len(calibration)} provided, target {DEFAULT_NUM_CALIBRATION_SAMPLES})"
     )
-    texts = _render_calibration_texts(samples, tokenizer, source_dir)
+    texts = _render_calibration_texts(samples, tokenizer, source_dir, log_cb)
 
     log_cb(f"Starting oneshot quantization: {format}")
     oneshot(
@@ -279,6 +303,12 @@ def quantize_safetensors(
     )
 
     output_dir = Path(output_dir)
+    if not (output_dir / "config.json").exists() or not any(output_dir.glob("*.safetensors")):
+        raise RuntimeError(
+            f"{format} quantization produced no valid output in {output_dir} "
+            "(missing config.json and/or *.safetensors files)"
+        )
+
     if source_dir is not None and source_dir.exists():
         from shutil import copy
 
