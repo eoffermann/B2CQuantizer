@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from functools import lru_cache
 from pathlib import Path
 from tempfile import mkdtemp
@@ -12,7 +13,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
 
-from b2cq.quant_catalog import CATALOG, QuantFamily, by_family, get as get_quant
+from b2cq.quant_catalog import QuantFamily, by_family, get as get_quant
 from b2cq.job_model import JobStore, QuantResult, QuantStatus
 from b2cq.calibration import CalibrationSource, load_calibration
 from b2cq.hf_client import HFClient
@@ -55,15 +56,6 @@ async def setup(request: Request):
     })
 
 
-@router.post("/calibration/upload")
-async def calibration_upload(calibration_file: UploadFile = File(...)):
-    """HTMX upload handler; returns a token id the setup form uses."""
-    workdir = Path(mkdtemp(prefix="b2cq_cal_"))
-    cal_path = workdir / "cal.jsonl"
-    cal_path.write_bytes(await calibration_file.read())
-    return {"token": str(cal_path)}
-
-
 @router.post("/jobs")
 async def create_job(
     source_model: str = Form(...),
@@ -78,33 +70,41 @@ async def create_job(
 ):
     # Build calibration source
     workdir = Path(mkdtemp(prefix="b2cq_"))
-    if calibration_type == "upload" and calibration_file is not None:
-        cal_path = workdir / "cal.jsonl"
-        cal_path.write_bytes(await calibration_file.read())
-        cal_source = CalibrationSource(type="upload", local_path=cal_path)
-    elif calibration_type == "hf_dataset":
-        cal_source = CalibrationSource(type="hf_dataset", hf_dataset_id=calibration_dataset,
-                                        hf_token=hf_token)
-    else:
-        cal_source = CalibrationSource(type="bundled")
+    try:
+        if calibration_type == "upload" and calibration_file is not None:
+            cal_path = workdir / "cal.jsonl"
+            cal_path.write_bytes(await calibration_file.read())
+            cal_source = CalibrationSource(type="upload", local_path=cal_path)
+        elif calibration_type == "hf_dataset":
+            cal_source = CalibrationSource(type="hf_dataset", hf_dataset_id=calibration_dataset,
+                                            hf_token=hf_token)
+        else:
+            cal_source = CalibrationSource(type="bundled")
 
-    calibration = load_calibration(cal_source)
+        calibration = load_calibration(cal_source)
 
-    # Resolve owner from token if not supplied
-    hf_client = HFClient(token=hf_token)
-    if not owner:
-        owner = hf_client.whoami().get("name", "unknown")
+        # Resolve owner from token if not supplied
+        hf_client = HFClient(token=hf_token)
+        if not owner:
+            owner = hf_client.whoami().get("name", "unknown")
 
-    # Build quant results
-    quant_results = []
-    for qid in quants:
-        spec = get_quant(qid)
-        lane = "A" if spec.family == QuantFamily.SAFETENSORS else "B"
-        quant_results.append(QuantResult(quant_id=qid, status=QuantStatus.PENDING, lane=lane))
+        # Build quant results
+        quant_results = []
+        for qid in quants:
+            spec = get_quant(qid)
+            lane = "A" if spec.family == QuantFamily.SAFETENSORS else "B"
+            quant_results.append(QuantResult(quant_id=qid, status=QuantStatus.PENDING, lane=lane))
+    except Exception:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
 
+    # Never persist the raw HF token on the long-lived Job/JobStore: use
+    # cal_source (which may carry hf_token) for the actual load above and
+    # for run_job, but store a token-stripped copy on the job.
+    job_cal_source = cal_source.model_copy(update={"hf_token": None})
     job = JOB_STORE.create(
         source_model=source_model, owner=owner, quants=quant_results,
-        calibration=cal_source, private=private,
+        calibration=job_cal_source, private=private,
         update_source_readme=update_source_readme,
     )
 

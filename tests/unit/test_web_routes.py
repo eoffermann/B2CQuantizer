@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import b2cq.web.routes as routes
+from b2cq.job_model import QuantStatus
 from b2cq.main import app
 
 client = TestClient(app)
@@ -118,3 +119,86 @@ def test_create_job_owner_resolved_from_whoami_when_absent(monkeypatch):
 
     view = client.get(resp.headers["location"])
     assert "testuser" in view.text
+
+
+def test_create_job_hf_dataset_token_not_persisted_on_job(monkeypatch):
+    """CRITICAL: the raw HF token must never live on the stored Job/JobStore
+    (it's never evicted), even though it's needed transiently to load the
+    calibration dataset and to build the HFClient."""
+    _install_fakes(monkeypatch)
+    monkeypatch.setattr(routes, "load_calibration", lambda source: [{"messages": []}])
+
+    data = {
+        "source_model": "acme/test-model-7b",
+        "hf_token": "hf_supersecrettoken",
+        "calibration_type": "hf_dataset",
+        "calibration_dataset": "acme/some-dataset",
+        "quants": ["Q4_K_M"],
+        "owner": "acme",
+    }
+    resp = client.post("/jobs", data=data, follow_redirects=False)
+    assert resp.status_code == 303
+    job_id = resp.headers["location"].split("/jobs/")[1]
+
+    job = routes.JOB_STORE.get(job_id)
+    assert job.calibration.type == "hf_dataset"
+    assert job.calibration.hf_token is None
+    # And the secret must not leak into the rendered page either.
+    assert "hf_supersecrettoken" not in client.get(resp.headers["location"]).text
+
+
+def test_job_view_seeds_alpine_state_from_stored_job(monkeypatch):
+    """IMPORTANT: reloading the job page (e.g. mid-flight or after
+    completion) must reflect the persisted QuantResult state, not always
+    show 'pending'/blank cells until the next SSE event arrives."""
+    _install_fakes(monkeypatch)
+
+    data = {
+        "source_model": "acme/test-model-7b",
+        "hf_token": "hf_testtoken123",
+        "calibration_type": "bundled",
+        "quants": ["Q4_K_M"],
+        "owner": "acme",
+    }
+    files = {"calibration_file": ("cal.jsonl", b"", "application/octet-stream")}
+    resp = client.post("/jobs", data=data, files=files, follow_redirects=False)
+    job_id = resp.headers["location"].split("/jobs/")[1]
+
+    job = routes.JOB_STORE.get(job_id)
+    q = job.quants[0]
+    q.status = QuantStatus.DONE
+    q.elapsed_seconds = 42.0
+    q.output_size_bytes = 12345
+    q.upload_url = "https://huggingface.co/acme/test-model-7b-Q4_K_M"
+
+    view = client.get(resp.headers["location"])
+    assert view.status_code == 200
+    body = view.text
+    assert "'done'" in body or '"done"' in body
+    assert "42.0" in body
+    assert "https://huggingface.co/acme/test-model-7b-Q4_K_M" in body
+
+
+def test_calibration_upload_endpoint_removed():
+    """MINOR/controller decision: the unauthenticated multipart-upload
+    endpoint is dead code and a disk-fill/arbitrary-file-write surface; it
+    has been removed in favor of the setup form's direct POST /jobs."""
+    resp = client.post(
+        "/calibration/upload",
+        files={"calibration_file": ("cal.jsonl", b"{}", "application/octet-stream")},
+    )
+    assert resp.status_code == 404
+
+
+def test_job_stream_route_returns_event_stream():
+    """MINOR: cheap smoke test for the SSE route.
+
+    A real client.stream(...) GET hangs under Starlette's TestClient here
+    (the endpoint never flushes a response until PROGRESS publishes an
+    event for the job, which never happens for an unused job id), so per
+    the fallback plan we assert the route is registered with the expected
+    path/methods instead of consuming the stream.
+    """
+    matches = [r for r in app.routes if getattr(r, "path", None) == "/jobs/{job_id}/stream"]
+    assert len(matches) == 1
+    assert "GET" in matches[0].methods

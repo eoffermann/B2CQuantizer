@@ -38,11 +38,19 @@
 <script>
 function jobView() {
     return {
-        jobStatus: 'running',
-        statuses: {},
-        elapsed: {},
-        sizes: {},
-        urls: {},
+        jobStatus: {{ job.status | tojson }},
+        statuses: {
+            {% for q in job.quants %}'{{ q.quant_id }}': {{ q.status.value | tojson }}{% if not loop.last %},{% endif %}{% endfor %}
+        },
+        elapsed: {
+            {% for q in job.quants %}{% if q.elapsed_seconds is not none %}'{{ q.quant_id }}': {{ q.elapsed_seconds | tojson }},{% endif %}{% endfor %}
+        },
+        sizes: {
+            {% for q in job.quants %}{% if q.output_size_bytes is not none %}'{{ q.quant_id }}': {{ q.output_size_bytes | tojson }},{% endif %}{% endfor %}
+        },
+        urls: {
+            {% for q in job.quants %}{% if q.upload_url is not none %}'{{ q.quant_id }}': {{ q.upload_url | tojson }},{% endif %}{% endfor %}
+        },
         laneA: '',
         laneB: '',
         init() {
