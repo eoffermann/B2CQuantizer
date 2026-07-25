@@ -1,5 +1,6 @@
 """HFClient thin wrapper — token handling + method signatures."""
 import io
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
 from b2cq.hf_client import HFClient
@@ -29,6 +30,7 @@ def test_calls_after_close_raise():
 CLOSED_METHOD_CASES = [
     ("whoami", (), {}),
     ("download_snapshot", ("user/repo", "/tmp/local-dir"), {}),
+    ("download_file", ("user/repo", "README.md"), {}),
     ("upload_folder", ("user/repo", "/tmp/local-dir"), {}),
     ("upload_file", ("user/repo", "/tmp/file.bin", "weights/file.bin"), {}),
     ("update_file", ("user/repo", "README.md", "content", "commit msg"), {}),
@@ -40,9 +42,10 @@ CLOSED_METHOD_CASES = [
     CLOSED_METHOD_CASES,
     ids=[case[0] for case in CLOSED_METHOD_CASES],
 )
+@patch("huggingface_hub.hf_hub_download")
 @patch("huggingface_hub.snapshot_download")
 @patch("b2cq.hf_client.HfApi")
-def test_every_public_method_raises_after_close(HfApi, snapshot_download, method_name, args, kwargs):
+def test_every_public_method_raises_after_close(HfApi, snapshot_download, hf_hub_download, method_name, args, kwargs):
     c = HFClient(token="hf_supersecret")
     c.close()
     method = getattr(c, method_name)
@@ -50,6 +53,7 @@ def test_every_public_method_raises_after_close(HfApi, snapshot_download, method
         method(*args, **kwargs)
     HfApi.assert_not_called()
     snapshot_download.assert_not_called()
+    hf_hub_download.assert_not_called()
 
 
 @patch("b2cq.hf_client.HfApi")
@@ -61,6 +65,15 @@ def test_whoami_forwards_token(HfApi):
     result = c.whoami()
     HfApi.assert_called_once_with(token="hf_x")
     assert result == {"name": "eddie"}
+
+
+@patch("huggingface_hub.hf_hub_download")
+def test_download_file_forwards_args(hf_hub_download):
+    hf_hub_download.return_value = "/cache/user/repo/README.md"
+    c = HFClient(token="hf_x")
+    result = c.download_file("user/repo", "README.md")
+    hf_hub_download.assert_called_once_with(repo_id="user/repo", filename="README.md", token="hf_x")
+    assert result == Path("/cache/user/repo/README.md")
 
 
 @patch("b2cq.hf_client.HfApi")

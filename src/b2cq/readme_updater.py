@@ -45,14 +45,11 @@ def _splice_section(original: str, new_section: str) -> str:
 
 def update_source_readme(job: Job, hf_client: HFClient) -> str:
     """Fetch source README, splice ## Quantizations, upload back. Returns commit URL."""
-    from huggingface_hub import hf_hub_download
-    from pathlib import Path
-    api = hf_client._api()  # uses token from HFClient
+    from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
     try:
-        p = hf_hub_download(repo_id=job.source_model, filename="README.md",
-                            token=hf_client._token)
-        original = Path(p).read_text(encoding="utf-8")
-    except Exception:
+        p = hf_client.download_file(job.source_model, "README.md")
+        original = p.read_text(encoding="utf-8")
+    except (EntryNotFoundError, RepositoryNotFoundError):
         original = f"# {job.source_model}\n\n"
 
     new = _splice_section(original, _render_section(job))

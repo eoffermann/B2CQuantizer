@@ -42,6 +42,12 @@ class HFClient:
         p = snapshot_download(repo_id=repo_id, local_dir=str(local_dir), token=self._token)
         return Path(p)
 
+    def download_file(self, repo_id: str, filename: str) -> Path:
+        if self._token is None:
+            raise RuntimeError("HFClient is closed")
+        from huggingface_hub import hf_hub_download
+        return Path(hf_hub_download(repo_id=repo_id, filename=filename, token=self._token))
+
     def upload_folder(self, repo_id: str, folder_path: str | Path, *,
                       create_if_missing: bool = True, private: bool = False,
                       commit_message: str | None = None) -> str:
