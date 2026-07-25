@@ -30,3 +30,6 @@ Thumbs.db
 
 # Controller scratch
 .superpowers/
+
+# Generated calibration corpus (built at image-build time or locally)
+src/b2cq_data/calibration/bundled.jsonl
