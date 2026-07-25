@@ -1,0 +1,8 @@
+# Files that end up inside the Linux container must stay LF on every checkout,
+# or bash/python will choke on \r (classic Windows-checkout Docker breakage).
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.py text eol=lf
+*.toml text eol=lf
+*.jsonl text eol=lf
+*.jinja text eol=lf
