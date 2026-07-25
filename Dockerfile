@@ -31,16 +31,17 @@ RUN python3 -m pip install --index-url https://download.pytorch.org/whl/cu128 \
 # transformers 4.56-4.57 / accelerate 1.6-1.12 stack matching pyproject.toml.
 RUN python3 -m pip install "llmcompressor==0.10.*"
 
+# Build llama.cpp (before app deps: the multi-arch CUDA compile is the most
+# expensive layer and must not be invalidated by routine pyproject changes)
+COPY scripts/build_llama_cpp.sh /opt/build_llama_cpp.sh
+RUN chmod +x /opt/build_llama_cpp.sh && /opt/build_llama_cpp.sh
+
 # App deps (from pyproject.toml, but copied first for cache reuse)
 COPY pyproject.toml /app/pyproject.toml
 COPY src/b2cq/__init__.py /app/src/b2cq/__init__.py
 COPY src/b2cq_data/__init__.py /app/src/b2cq_data/__init__.py
 WORKDIR /app
 RUN python3 -m pip install -e ".[dev]"
-
-# Build llama.cpp
-COPY scripts/build_llama_cpp.sh /opt/build_llama_cpp.sh
-RUN chmod +x /opt/build_llama_cpp.sh && /opt/build_llama_cpp.sh
 
 # Build bundled calibration corpus
 COPY scripts/build_bundled_calibration.py /tmp/build_cal.py
