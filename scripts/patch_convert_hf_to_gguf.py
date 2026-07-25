@@ -34,7 +34,8 @@ def apply_patches() -> None:
             r"        \2"
         )
         src, n = pattern1.subn(replacement1, src, count=1)
-        assert n == 1, "Patch 1 failed to apply — file structure may have changed"
+        if n != 1:
+            raise RuntimeError("Patch 1 failed to apply — file structure may have changed")
 
     # Patch 2: pixtral activation flag — use projector_hidden_act instead of hparams["hidden_act"]
     marker2 = "# --- B2CQ patch: pixtral projector activation ---"
@@ -50,7 +51,8 @@ def apply_patches() -> None:
             r"\g<2>_proj_act == 'silu'\g<4>_proj_act == 'gelu'"
         )
         src, n = pattern2.subn(replacement2, src, count=1)
-        assert n == 1, "Patch 2 failed to apply — file structure may have changed"
+        if n != 1:
+            raise RuntimeError("Patch 2 failed to apply — file structure may have changed")
 
     if src != original:
         CONVERT_PY.write_text(src, encoding="utf-8")
