@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block body %}
+<div x-data="jobView()" hx-ext="sse" sse-connect="/jobs/{{ job.id }}/stream">
+    <h1 class="text-2xl font-semibold">Job {{ job.id }}</h1>
+    <p class="text-slate-600">Source: {{ job.source_model }} · Owner: {{ job.owner }}</p>
+    <p x-text="'Status: ' + jobStatus" class="mt-2 font-medium"></p>
+
+    <table class="mt-6 w-full text-sm">
+        <thead class="text-left border-b">
+            <tr><th>Quant</th><th>Lane</th><th>Status</th><th>Elapsed</th><th>Size</th><th>Repo</th></tr>
+        </thead>
+        <tbody>
+        {% for q in job.quants %}
+        <tr class="border-b" :class="statuses['{{ q.quant_id }}'] === 'failed' ? 'bg-red-50' : ''">
+            <td class="py-2">{{ q.quant_id }}</td>
+            <td>{{ q.lane }}</td>
+            <td x-text="statuses['{{ q.quant_id }}'] || '{{ q.status.value }}'"></td>
+            <td x-text="(elapsed['{{ q.quant_id }}'] || 0).toFixed(0) + 's'"></td>
+            <td x-text="sizes['{{ q.quant_id }}'] || '—'"></td>
+            <td><a x-show="urls['{{ q.quant_id }}']" :href="urls['{{ q.quant_id }}']" class="text-blue-600 underline">↗</a></td>
+        </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+
+    <div class="mt-8 grid grid-cols-2 gap-4">
+        <div>
+            <h3 class="font-medium">Lane A (safetensors)</h3>
+            <pre class="bg-slate-900 text-slate-100 p-3 text-xs h-64 overflow-auto" x-text="laneA"></pre>
+        </div>
+        <div>
+            <h3 class="font-medium">Lane B (GGUF)</h3>
+            <pre class="bg-slate-900 text-slate-100 p-3 text-xs h-64 overflow-auto" x-text="laneB"></pre>
+        </div>
+    </div>
+</div>
+
+<script>
+function jobView() {
+    return {
+        jobStatus: 'running',
+        statuses: {},
+        elapsed: {},
+        sizes: {},
+        urls: {},
+        laneA: '',
+        laneB: '',
+        init() {
+            const knownLane = { {% for q in job.quants %}'{{ q.quant_id }}': '{{ q.lane }}'{% if not loop.last %},{% endif %}{% endfor %} };
+            this.$el.addEventListener('htmx:sseMessage', (e) => {
+                const evt = JSON.parse(e.detail.data);
+                if (evt.type === 'status') {
+                    this.statuses[evt.quant] = evt.status;
+                    if (evt.elapsed !== undefined) this.elapsed[evt.quant] = evt.elapsed;
+                } else if (evt.type === 'log') {
+                    const lane = knownLane[evt.quant] || (evt.quant.includes('lane_a') ? 'A' : 'B');
+                    if (lane === 'A') this.laneA = (this.laneA + '\n[' + evt.quant + '] ' + evt.line).slice(-8000);
+                    else this.laneB = (this.laneB + '\n[' + evt.quant + '] ' + evt.line).slice(-8000);
+                } else if (evt.type === 'job_complete') {
+                    this.jobStatus = 'complete';
+                } else if (evt.type === 'job_failed') {
+                    this.jobStatus = 'failed: ' + evt.error;
+                }
+            });
+        }
+    };
+}
+</script>
+{% endblock %}

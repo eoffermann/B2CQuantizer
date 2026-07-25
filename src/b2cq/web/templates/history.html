@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block body %}
+<h1 class="text-2xl font-semibold mb-4">Jobs in this session</h1>
+<p class="text-slate-600 mb-4">History is in-memory only; wiped on pod restart.</p>
+<table class="w-full text-sm">
+    <thead class="text-left border-b">
+        <tr><th>Job</th><th>Source</th><th>Started</th><th>Status</th><th>Quants</th></tr>
+    </thead>
+    <tbody>
+    {% for job in jobs %}
+    <tr class="border-b">
+        <td><a href="/jobs/{{ job.id }}" class="text-blue-600 underline">{{ job.id }}</a></td>
+        <td>{{ job.source_model }}</td>
+        <td>{{ job.started_at.isoformat() }}</td>
+        <td>{{ job.status }}</td>
+        <td>{{ job.quants | length }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

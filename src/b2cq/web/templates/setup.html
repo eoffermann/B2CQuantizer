@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% block body %}
+<form method="post" action="/jobs" enctype="multipart/form-data" class="space-y-6" x-data="{ calType: 'bundled' }">
+    <div>
+        <label class="block text-sm font-medium">Source model (HF repo id)</label>
+        <input name="source_model" required class="w-full border rounded px-3 py-2"
+               placeholder="mistralai/Mistral-Small-3.2-24B-Instruct-2506">
+    </div>
+    <div>
+        <label class="block text-sm font-medium">HuggingFace token</label>
+        <input name="hf_token" type="password" required class="w-full border rounded px-3 py-2">
+        <p class="text-xs text-slate-500 mt-1">Held in memory only; wiped when the job completes.</p>
+    </div>
+    <div>
+        <label class="block text-sm font-medium">Calibration source</label>
+        <select name="calibration_type" x-model="calType" class="border rounded px-2 py-1">
+            <option value="bundled">Bundled generic corpus</option>
+            <option value="upload">Upload JSONL</option>
+            <option value="hf_dataset">HuggingFace dataset ID</option>
+        </select>
+        <div x-show="calType === 'upload'" class="mt-2">
+            <input name="calibration_file" type="file" accept=".jsonl">
+        </div>
+        <div x-show="calType === 'hf_dataset'" class="mt-2">
+            <input name="calibration_dataset" placeholder="bigblueceiling/frndobrain-cal-v1"
+                   class="border rounded px-2 py-1">
+        </div>
+    </div>
+    <fieldset>
+        <legend class="text-sm font-medium mb-2">GGUF K-quants</legend>
+        {% for q in gguf_k %}
+        <label class="inline-flex items-center mr-4">
+            <input type="checkbox" name="quants" value="{{ q.id }}"> <span class="ml-1">{{ q.name }}</span>
+        </label>
+        {% endfor %}
+    </fieldset>
+    <fieldset>
+        <legend class="text-sm font-medium mb-2">GGUF I-quants (require imatrix pre-step)</legend>
+        {% for q in gguf_i %}
+        <label class="inline-flex items-center mr-4">
+            <input type="checkbox" name="quants" value="{{ q.id }}"> <span class="ml-1">{{ q.name }}</span>
+        </label>
+        {% endfor %}
+    </fieldset>
+    <fieldset>
+        <legend class="text-sm font-medium mb-2">GGUF misc + mmproj</legend>
+        {% for q in gguf_misc %}
+        <label class="inline-flex items-center mr-4">
+            <input type="checkbox" name="quants" value="{{ q.id }}"> <span class="ml-1">{{ q.name }}</span>
+        </label>
+        {% endfor %}
+        {% for q in gguf_mmproj %}
+        <label class="inline-flex items-center mr-4">
+            <input type="checkbox" name="quants" value="{{ q.id }}" checked>
+            <span class="ml-1">{{ q.name }} <small>(multimodal)</small></span>
+        </label>
+        {% endfor %}
+    </fieldset>
+    <fieldset>
+        <legend class="text-sm font-medium mb-2">safetensors</legend>
+        {% for q in safetensors %}
+        <label class="inline-flex items-center mr-4">
+            <input type="checkbox" name="quants" value="{{ q.id }}"
+                {% if 'blackwell' in q.hardware_requirements and not blackwell_available %}disabled{% endif %}>
+            <span class="ml-1">{{ q.name }}
+                {% if 'blackwell' in q.hardware_requirements and not blackwell_available %}
+                    <small class="text-red-600">(needs Blackwell GPU)</small>
+                {% endif %}
+            </span>
+        </label>
+        {% endfor %}
+    </fieldset>
+    <div>
+        <label class="block text-sm font-medium">Upload owner</label>
+        <input name="owner" placeholder="bigblueceiling" class="border rounded px-2 py-1">
+    </div>
+    <div class="flex items-center space-x-4">
+        <label><input type="checkbox" name="private"> Private repos</label>
+        <label><input type="checkbox" name="update_source_readme" checked> Update source README</label>
+    </div>
+    <button type="submit" class="bg-slate-900 text-white px-4 py-2 rounded">Launch job</button>
+</form>
+{% endblock %}
