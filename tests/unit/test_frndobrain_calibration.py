@@ -125,6 +125,44 @@ def test_real_mistral_common_v11_attribute_contract(tmp_path):
     assert it._message_position_to_encode_tools_settings == UserMessagePosition.first
 
 
+def test_render_calibration_frndobrain_real_tokenizer_path(tmp_path):
+    """Exercise the REAL render path via mistral-common's ChatCompletionRequest +
+    encode_chat_completion against a production tokenizer. This verifies that
+    regressions in ChatCompletionRequest argument handling (e.g., tools=None
+    rejection) get caught -- existing tests stub the tokenizer or stop at
+    construction."""
+    import b2cq.workers.safetensors as st
+
+    _write_synthetic_v11_tekken_json(tmp_path / "tekken.json")
+    tok = build_frndobrain_tokenizer(tmp_path)
+
+    # (a) Sample with only "messages" (no "tools" key).
+    # In finetuning mode, last message must be assistant, so pair user+assistant.
+    sample_messages_only = {
+        "messages": [
+            {"role": "user", "content": "Hello, what is 2+2?"},
+            {"role": "assistant", "content": "2+2 equals 4."},
+        ]
+    }
+    rendered = st._render_calibration_frndobrain(tok, sample_messages_only)
+    assert isinstance(rendered, str)
+    assert len(rendered) > 0
+    assert "[INST]" in rendered
+
+    # (b) Sample with explicit "tools": None
+    sample_tools_none = {
+        "messages": [
+            {"role": "user", "content": "What is the capital of France?"},
+            {"role": "assistant", "content": "The capital of France is Paris."},
+        ],
+        "tools": None,
+    }
+    rendered = st._render_calibration_frndobrain(tok, sample_tools_none)
+    assert isinstance(rendered, str)
+    assert len(rendered) > 0
+    assert "[INST]" in rendered
+
+
 # ---------------------------------------------------------------------------
 # (d) quantize_safetensors dispatch: FrndoBrain hard-fail + HF fallback
 # ---------------------------------------------------------------------------
