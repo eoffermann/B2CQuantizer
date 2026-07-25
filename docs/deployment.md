@@ -14,7 +14,7 @@ The right GPU depends on the model size and which quant formats you plan to sele
 | Requirement | Minimum GPU | Why |
 |---|---|---|
 | 24B-parameter Mistral/Mistral3 source, GGUF + non-NVFP4 safetensors quants | **H100 80 GB** or **A100 96 GB** | BF16 weights for a 24B model are ~48 GB; loading the full model on GPU for Lane A plus headroom for calibration activations needs a large-memory card. |
-| Any job that includes **NVFP4** in the quant selection | **RTX PRO 6000 Blackwell** or **RTX 5090** (Blackwell tier, compute capability SM ≥ 12.0) | NVFP4 kernels require Blackwell tensor cores (compute capability SM ≥ 12.0, per `SPEC.md` §7). The Docker image is built against CUDA 12.8 specifically for SM120 support. Non-Blackwell GPUs cannot run NVFP4 at all — the UI grays the option out when it detects `torch.cuda.get_device_properties(0).major < 12` (per `PLAN.md` Global Constraints). |
+| Any job that includes **NVFP4** in the quant selection | **RTX PRO 6000 Blackwell** or **RTX 5090** (Blackwell tier, compute capability SM ≥ 12.0) | NVFP4 kernels require Blackwell tensor cores (Blackwell-only per `SPEC.md` §7; SM < 12 gate per `SPEC.md` §10). The Docker image is built against CUDA 12.8 specifically for SM120 support. Non-Blackwell GPUs cannot run NVFP4 at all — the UI grays the option out when it detects `torch.cuda.get_device_properties(0).major < 12` (per `PLAN.md` Global Constraints). |
 | Smaller / non-24B source models, GGUF-only jobs | Smaller GPUs may work | Not a target configuration for v1; size the GPU to comfortably hold the source model in BF16 plus working memory for whichever safetensors formats you select. |
 
 If you plan to run **both** a 24B-class model **and** NVFP4, you need a card that is both
