@@ -36,6 +36,8 @@ class HFClient:
         return self._api().whoami()
 
     def download_snapshot(self, repo_id: str, local_dir: str | Path) -> Path:
+        if self._token is None:
+            raise RuntimeError("HFClient is closed")
         from huggingface_hub import snapshot_download
         p = snapshot_download(repo_id=repo_id, local_dir=str(local_dir), token=self._token)
         return Path(p)
