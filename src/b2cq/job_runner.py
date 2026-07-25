@@ -19,7 +19,7 @@ from pathlib import Path
 
 from b2cq.calibration import to_plaintext
 from b2cq.hf_client import HFClient
-from b2cq.job_model import Job, QuantStatus, QuantResult
+from b2cq.job_model import Job, QuantStatus
 from b2cq.progress import ProgressBus
 from b2cq.quant_catalog import get as get_quant, QuantFamily
 from b2cq.workers.safetensors import load_model_for_safetensors, quantize_safetensors
@@ -31,7 +31,7 @@ from b2cq.readme_updater import update_source_readme
 
 def _mk_log_cb(job_id: str, quant_id: str, progress: ProgressBus, tail: list[str]):
     """Bounded log-tail + publish each line to the progress bus."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     def cb(line: str) -> None:
         tail.append(line)
@@ -145,14 +145,17 @@ async def _run_lane_b(job: Job, source_dir: Path, calibration, hf_client, progre
 
     # For each GGUF quant, produce and upload
     default_repo_id = f"{job.owner}/{Path(job.source_model).name}-GGUF"
-    for q in gguf_quants:
-        if q.status == QuantStatus.SKIPPED:  # from imatrix failure
-            continue
-        await _run_one_gguf_quant(job, q, bf16_gguf, imatrix_path, source_dir, default_repo_id,
-                                    hf_client, progress, workdir)
-
-    # cleanup BF16 intermediate
-    bf16_gguf.unlink(missing_ok=True)
+    try:
+        for q in gguf_quants:
+            if q.status == QuantStatus.SKIPPED:  # from imatrix failure
+                continue
+            await _run_one_gguf_quant(job, q, bf16_gguf, imatrix_path, source_dir, default_repo_id,
+                                        hf_client, progress, workdir)
+    finally:
+        # cleanup BF16 intermediate -- must run even if the loop above escapes
+        # with an unexpected exception, so the large intermediate file never
+        # lingers on disk.
+        bf16_gguf.unlink(missing_ok=True)
 
 
 async def _run_one_gguf_quant(job, q, bf16_gguf, imatrix_path, source_dir, default_repo_id,
@@ -204,6 +207,13 @@ async def run_job(job: Job, hf_client: HFClient, calibration: list[dict],
     """Orchestrate a full job: download source, run both lanes concurrently,
     update the source README, then always wipe the HF token.
 
+    Both lanes are awaited with `return_exceptions=True`, so an unexpected
+    exception escaping one lane never leaves the sibling lane running
+    detached while `hf_client.close()` fires underneath it. Only after both
+    lanes have genuinely finished do we check for an escaped exception; if
+    one occurred, the job is marked failed and the README-update phase is
+    skipped.
+
     Unexpected exceptions escaping the lane/README phase are caught,
     published as `job_failed`, and swallowed (never re-raised) -- this
     coroutine is expected to run as a background task, where an unhandled
@@ -226,11 +236,34 @@ async def run_job(job: Job, hf_client: HFClient, calibration: list[dict],
             return
 
         try:
-            # Run both lanes concurrently
-            await asyncio.gather(
+            # Run both lanes concurrently. return_exceptions=True is required:
+            # without it, an unexpected exception escaping one lane would
+            # propagate immediately while the sibling lane keeps running
+            # detached, and the outer finally's hf_client.close() would then
+            # wipe the token out from under the still-running lane mid-upload.
+            # With return_exceptions=True, gather waits for BOTH lanes to
+            # genuinely finish (success or exception) before we inspect the
+            # results below.
+            lane_results = await asyncio.gather(
                 _run_lane_a(job, source_dir, calibration, hf_client, progress, workdir),
                 _run_lane_b(job, source_dir, calibration, hf_client, progress, workdir),
+                return_exceptions=True,
             )
+
+            lane_names = ("A", "B")
+            lane_errors = [
+                (lane_names[i], result)
+                for i, result in enumerate(lane_results)
+                if isinstance(result, BaseException)
+            ]
+            if lane_errors:
+                error_msg = "; ".join(
+                    f"lane {name}: {type(err).__name__}: {err}" for name, err in lane_errors
+                )
+                job.status = "failed"
+                job.finished_at = datetime.now(timezone.utc)
+                await progress.publish(job.id, {"type": "job_failed", "error": error_msg})
+                return
 
             # README update
             if job.update_source_readme:

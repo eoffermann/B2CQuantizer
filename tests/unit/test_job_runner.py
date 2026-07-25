@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import b2cq.job_runner as job_runner_module
 from b2cq.calibration import CalibrationSource
 from b2cq.hf_client import HFClient
 from b2cq.job_model import Job, QuantResult, QuantStatus
@@ -284,6 +285,46 @@ async def test_quantize_safetensors_receives_explicit_source_dir(tmp_path, monke
 
     assert captured["source_dir"] == tmp_path / "source"
     assert _status_map(job)["W4A16_GPTQ"].status == QuantStatus.DONE
+
+
+# ---------------------------------------------------------------------------
+# (f) unexpected exception escaping one lane doesn't orphan the sibling lane
+# ---------------------------------------------------------------------------
+
+async def test_unexpected_lane_exception_does_not_orphan_sibling_lane(tmp_path, monkeypatch):
+    """If a lane coroutine raises an exception that escapes its own internal
+    try/except (i.e. a bug, not a modeled per-quant/per-lane-setup failure),
+    `run_job` must still wait for the sibling lane to finish naturally before
+    tearing anything down -- otherwise `hf_client.close()` would wipe the
+    token out from under a lane that's still mid-upload.
+    """
+    job = _make_job(["W4A16_GPTQ", "Q4_K_M"])  # A: well-behaved, B: broken
+
+    async def broken_lane_b(job, source_dir, calibration, hf_client, progress, workdir):
+        raise RuntimeError("lane b exploded unexpectedly")
+
+    _patch_workers(monkeypatch)  # lane A's workers stay well-behaved
+    monkeypatch.setattr(job_runner_module, "_run_lane_b", broken_lane_b)
+    hf_client = _make_hf_client()
+    progress = RecordingProgress()
+
+    await run_job(job, hf_client, CALIBRATION, progress, tmp_path)
+
+    statuses = _status_map(job)
+    # the job as a whole is marked failed because of the escaped lane error
+    assert job.status == "failed"
+    job_failed = progress.of_type("job_failed")
+    assert len(job_failed) == 1
+    assert "lane B" in job_failed[0]["error"]
+    assert "lane b exploded unexpectedly" in job_failed[0]["error"]
+
+    # the sibling (lane A) lane was NOT orphaned -- it ran to completion and
+    # reached a terminal status before close() fired
+    assert statuses["W4A16_GPTQ"].status == QuantStatus.DONE
+
+    # close() still only fires exactly once, after both lanes genuinely
+    # finished
+    hf_client.close.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
