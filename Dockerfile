@@ -20,12 +20,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Upgrade pip
 RUN python3 -m pip install --upgrade pip setuptools wheel
 
-# PyTorch with CUDA 12.8 wheel (must come from pytorch index)
+# PyTorch with CUDA 12.8 wheel (must come from pytorch index).
+# torch 2.10.* is the newest cu128 wheel within llmcompressor 0.10's supported
+# range (torch>=2.9,<=2.10) and provides Blackwell/SM120 support (needs >=2.7).
 RUN python3 -m pip install --index-url https://download.pytorch.org/whl/cu128 \
-        "torch==2.5.*"
+        "torch==2.10.*"
 
-# llm-compressor and other heavy deps
-RUN python3 -m pip install "llm-compressor==0.3.*"
+# llmcompressor (PyPI name is "llmcompressor", NOT "llm-compressor") and other
+# heavy deps. 0.10.* ships AWQModifier + NVFP4 (0.3 predated both) and pins a
+# transformers 4.56-4.57 / accelerate 1.6-1.12 stack matching pyproject.toml.
+RUN python3 -m pip install "llmcompressor==0.10.*"
 
 # App deps (from pyproject.toml, but copied first for cache reuse)
 COPY pyproject.toml /app/pyproject.toml

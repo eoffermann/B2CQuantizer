@@ -95,7 +95,7 @@ def _build_awq_mappings_scoped(model):
     aggregate: attention QKV smoothing, MLP gate/up smoothing, attention
     output balance, and MLP down-proj balance.
     """
-    from llmcompressor.modifiers.transform.awq import AWQMapping
+    from llmcompressor.modifiers.awq import AWQMapping
 
     n_layers = model.config.text_config.num_hidden_layers  # 40 for Mistral-Small-3.2-24B
     mappings = []
@@ -144,7 +144,7 @@ def _build_recipe(format: str, arch: str, model):
 
     from llmcompressor.modifiers.quantization import QuantizationModifier
     from llmcompressor.modifiers.quantization.gptq import GPTQModifier
-    from llmcompressor.modifiers.transform.awq import AWQModifier
+    from llmcompressor.modifiers.awq import AWQModifier
     from compressed_tensors.quantization import (
         QuantizationArgs,
         QuantizationScheme,
