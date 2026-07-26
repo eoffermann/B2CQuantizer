@@ -52,7 +52,7 @@ After uploads complete, the app commits a canonical `## Quantizations` table (Fo
    - **Disk:** ≥200 GB for 24B models (the app refuses to launch a job with <150 GB free).
 2. Run the image, exposing port 8000:
    ```bash
-   docker run -d --gpus all -p 8000:8000 ghcr.io/bigblueceiling/b2cquantizer:latest
+   docker run -d --gpus all -p 8000:8000 bigblueceiling/b2cquantizer:latest
    ```
 3. Open the UI via RunPod's port forwarding (SSH tunnel or access URL) — **the app has no auth or TLS of its own; the pod's port exposure is the trust boundary.**
 4. Enter the source model repo ID and your HF token, pick a calibration source, check the formats you want, review the generated repo names, and Launch.

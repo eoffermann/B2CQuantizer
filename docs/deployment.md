@@ -41,8 +41,10 @@ called out in the spec. Undersized disk during a job surfaces as a failure — s
 
 ## 3. Publishing the Docker image
 
-Build and push the image from the repository root to a registry your RunPod pod can pull from —
-GHCR or Docker Hub both work; use whichever your account is set up for.
+The canonical published image lives on Docker Hub: **`bigblueceiling/b2cquantizer`** (tags:
+`latest` plus a pinned version tag per release, e.g. `0.1.0`). If you are just deploying, skip
+to §5 and pull that. To publish your own build, push from the repository root to a registry your
+RunPod pod can pull from — GHCR or Docker Hub both work; use whichever your account is set up for.
 
 **GHCR:**
 ```bash
@@ -93,7 +95,7 @@ consumed by the OS/Docker layer, not by the B2CQuantizer application itself.
 Start the container with GPU access and port 8000 published:
 
 ```bash
-docker run -d --gpus all -p 8000:8000 ghcr.io/<your-org>/b2cquantizer:latest
+docker run -d --gpus all -p 8000:8000 bigblueceiling/b2cquantizer:latest
 ```
 
 On RunPod specifically, when creating the pod (via a Pod Template or the on-demand GPU pod UI):
