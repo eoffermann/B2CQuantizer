@@ -23,6 +23,11 @@
             <td x-text="sizes['{{ q.quant_id }}'] || '—'"></td>
             <td><a x-show="urls['{{ q.quant_id }}']" :href="urls['{{ q.quant_id }}']" class="text-blue-600 underline">↗</a></td>
         </tr>
+        <tr x-show="errors['{{ q.quant_id }}']">
+            <td colspan="6" class="pb-2">
+                <div class="bg-red-50 border border-red-200 text-red-800 text-xs p-2 rounded" x-text="errors['{{ q.quant_id }}']"></div>
+            </td>
+        </tr>
         {% endfor %}
         </tbody>
     </table>
@@ -55,6 +60,9 @@ function jobView() {
         urls: {
             {% for q in job.quants %}{% if q.upload_url is not none %}'{{ q.quant_id }}': {{ q.upload_url | tojson }},{% endif %}{% endfor %}
         },
+        errors: {
+            {% for q in job.quants %}{% if q.error %}'{{ q.quant_id }}': {{ q.error | tojson }},{% endif %}{% endfor %}
+        },
         laneA: '',
         laneB: '',
         warnings: [],
@@ -68,6 +76,8 @@ function jobView() {
                 if (evt.type === 'status') {
                     this.statuses[evt.quant] = evt.status;
                     if (evt.elapsed !== undefined) this.elapsed[evt.quant] = evt.elapsed;
+                    if (evt.error) this.errors[evt.quant] = evt.error;
+                    else delete this.errors[evt.quant];
                 } else if (evt.type === 'log') {
                     const lane = knownLane[evt.quant] || (evt.quant.includes('lane_a') ? 'A' : 'B');
                     if (lane === 'A') this.laneA = (this.laneA + '\n[' + evt.quant + '] ' + evt.line).slice(-8000);

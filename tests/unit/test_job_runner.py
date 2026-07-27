@@ -461,6 +461,179 @@ async def test_per_quant_log_files_written(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Observability fix: a failed quant / lane-setup must write the real error
+# (message + traceback) to its per-quant/setup .log file, not just q.error.
+# ---------------------------------------------------------------------------
+
+async def test_failing_lane_b_quant_writes_error_to_log_file(tmp_path, monkeypatch):
+    # LOG_ROOT must be a sibling of workdir (not nested inside it) -- run_job
+    # rmtree's the workdir on exit, and if LOG_ROOT lived under it the logs
+    # this test asserts on would be deleted before the assertions run.
+    monkeypatch.setattr(job_runner_module, "LOG_ROOT", tmp_path / "logs")
+    job = _make_job(["Q4_K_M", "Q5_K_M"])  # both GGUF_K -> lane B
+
+    def flaky_gguf_quantize(bf16_gguf, output_gguf, format, log_cb, imatrix=None):
+        if format == "Q5_K_M":
+            raise RuntimeError("quantize boom")
+        output_gguf = Path(output_gguf)
+        output_gguf.parent.mkdir(parents=True, exist_ok=True)
+        output_gguf.write_bytes(b"data")
+
+    _patch_workers(monkeypatch, gguf_quantize=flaky_gguf_quantize)
+    hf_client = _make_hf_client()
+    progress = RecordingProgress()
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    await run_job(job, hf_client, CALIBRATION, progress, workdir)
+
+    statuses = _status_map(job)
+    # unchanged behavior: q.error is still set
+    assert statuses["Q5_K_M"].status == QuantStatus.FAILED
+    assert "quantize boom" in statuses["Q5_K_M"].error
+
+    # new behavior: the per-quant .log file now contains the real failure
+    log_file = tmp_path / "logs" / job.id / "Q5_K_M.log"
+    assert log_file.exists()
+    log_text = log_file.read_text(encoding="utf-8")
+    assert "RuntimeError" in log_text
+    assert "quantize boom" in log_text
+    assert "Traceback" in log_text  # traceback.format_exc() was written
+
+
+async def test_failing_lane_a_quant_writes_error_to_log_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_runner_module, "LOG_ROOT", tmp_path / "logs")
+    job = _make_job(["W4A16_GPTQ"])
+
+    def flaky_quantize_safetensors(model, tokenizer, format, calibration, output_dir, source_dir, log_cb):
+        raise ValueError("gptq calibration exploded")
+
+    _patch_workers(monkeypatch, quantize_safetensors=flaky_quantize_safetensors)
+    hf_client = _make_hf_client()
+    progress = RecordingProgress()
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    await run_job(job, hf_client, CALIBRATION, progress, workdir)
+
+    statuses = _status_map(job)
+    # unchanged behavior: q.error is still set
+    assert statuses["W4A16_GPTQ"].status == QuantStatus.FAILED
+    assert "gptq calibration exploded" in statuses["W4A16_GPTQ"].error
+
+    # new behavior: the per-quant .log file now contains the real failure
+    log_file = tmp_path / "logs" / job.id / "W4A16_GPTQ.log"
+    assert log_file.exists()
+    log_text = log_file.read_text(encoding="utf-8")
+    assert "ValueError" in log_text
+    assert "gptq calibration exploded" in log_text
+    assert "Traceback" in log_text
+
+
+async def test_lane_a_setup_failure_writes_error_to_setup_log_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_runner_module, "LOG_ROOT", tmp_path / "logs")
+    job = _make_job(["W4A16_GPTQ", "Q4_K_M"])
+
+    def failing_load_model(source_dir, log_cb):
+        raise RuntimeError("cuda out of memory")
+
+    _patch_workers(monkeypatch, load_model_for_safetensors=failing_load_model)
+    hf_client = _make_hf_client()
+    progress = RecordingProgress()
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    await run_job(job, hf_client, CALIBRATION, progress, workdir)
+
+    statuses = _status_map(job)
+    assert statuses["W4A16_GPTQ"].status == QuantStatus.SKIPPED
+    assert "Lane A setup failed" in statuses["W4A16_GPTQ"].error
+
+    setup_log = tmp_path / "logs" / job.id / "__lane_a_setup__.log"
+    assert setup_log.exists()
+    setup_log_text = setup_log.read_text(encoding="utf-8")
+    assert "cuda out of memory" in setup_log_text
+    assert "RuntimeError" in setup_log_text
+    assert "Traceback" in setup_log_text
+
+
+async def test_lane_b_setup_failure_writes_error_to_setup_log_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_runner_module, "LOG_ROOT", tmp_path / "logs")
+    job = _make_job(["Q4_K_M"])
+
+    def failing_convert(source_dir, output_gguf, log_cb):
+        raise RuntimeError("llama.cpp convert crashed")
+
+    _patch_workers(monkeypatch, convert_to_bf16_gguf=failing_convert)
+    hf_client = _make_hf_client()
+    progress = RecordingProgress()
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    await run_job(job, hf_client, CALIBRATION, progress, workdir)
+
+    statuses = _status_map(job)
+    assert statuses["Q4_K_M"].status == QuantStatus.SKIPPED
+    assert "Lane B setup failed" in statuses["Q4_K_M"].error
+
+    setup_log = tmp_path / "logs" / job.id / "__lane_b_setup__.log"
+    assert setup_log.exists()
+    setup_log_text = setup_log.read_text(encoding="utf-8")
+    assert "llama.cpp convert crashed" in setup_log_text
+    assert "RuntimeError" in setup_log_text
+    assert "Traceback" in setup_log_text
+
+
+async def test_imatrix_failure_writes_error_to_imatrix_log_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_runner_module, "LOG_ROOT", tmp_path / "logs")
+    job = _make_job(["Q4_K_M", "IQ2_XS"])
+
+    def failing_imatrix(bf16_gguf, cal_text, output_imatrix, log_cb, n_chunks=100):
+        raise RuntimeError("imatrix crashed")
+
+    _patch_workers(monkeypatch, compute_imatrix=failing_imatrix)
+    hf_client = _make_hf_client()
+    progress = RecordingProgress()
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    await run_job(job, hf_client, CALIBRATION, progress, workdir)
+
+    statuses = _status_map(job)
+    assert statuses["IQ2_XS"].status == QuantStatus.SKIPPED
+    assert "imatrix failed" in statuses["IQ2_XS"].error
+
+    imatrix_log = tmp_path / "logs" / job.id / "__imatrix__.log"
+    assert imatrix_log.exists()
+    imatrix_log_text = imatrix_log.read_text(encoding="utf-8")
+    assert "imatrix crashed" in imatrix_log_text
+    assert "RuntimeError" in imatrix_log_text
+    assert "Traceback" in imatrix_log_text
+
+
+async def test_failed_quant_logs_error_to_stdout_logger(tmp_path, monkeypatch, caplog):
+    """Failures must also surface on container stdout via the stdlib logging
+    module, independent of the per-quant .log file / dashboard SSE stream."""
+    monkeypatch.setattr(job_runner_module, "LOG_ROOT", tmp_path / "logs")
+    job = _make_job(["Q4_K_M"])
+
+    def failing_gguf_quantize(bf16_gguf, output_gguf, format, log_cb, imatrix=None):
+        raise RuntimeError("stdout visibility check")
+
+    _patch_workers(monkeypatch, gguf_quantize=failing_gguf_quantize)
+    hf_client = _make_hf_client()
+    progress = RecordingProgress()
+    workdir = tmp_path / "wd"
+    workdir.mkdir()
+
+    with caplog.at_level("ERROR", logger="b2cq.job_runner"):
+        await run_job(job, hf_client, CALIBRATION, progress, workdir)
+
+    assert any("Q4_K_M" in rec.message and "FAILED" in rec.message for rec in caplog.records)
+    assert any("stdout visibility check" in rec.message for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
 # I6: hf uploads are retried with backoff (3 attempts) before giving up
 # ---------------------------------------------------------------------------
 

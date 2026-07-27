@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shutil
 import time
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,6 +35,12 @@ from b2cq.workers.gguf_convert import convert_to_bf16_gguf
 from b2cq.workers.gguf_quantize import gguf_quantize, compute_imatrix
 from b2cq.workers.mmproj import export_mmproj, is_multimodal
 from b2cq.readme_updater import update_source_readme
+
+# Container-stdout sink (RunPod surfaces this via `docker logs` without any
+# need for the per-quant log files or the dashboard). Only ever fed a single
+# summary line per failure -- never the HF token or other secrets, which
+# HFClient keeps out of exception messages entirely (see hf_client.py).
+logger = logging.getLogger("b2cq.job_runner")
 
 # Root directory for full per-quant log files (SPEC §13). Kept as a module
 # constant so tests can point it at a tmp dir instead of the real pod path.
@@ -75,6 +83,30 @@ def _mk_log_cb(job_id: str, quant_id: str, progress: ProgressBus, tail: list[str
     return cb
 
 
+def _log_failure(log_cb, job_id: str, target_id: str, error_str: str) -> None:
+    """Write the failure (message + full traceback) to the per-quant/setup
+    `.log` file via `log_cb`, and emit one summary line to container stdout
+    via the module `logger` (SPEC §13: the per-quant log file and
+    `docker logs` must both surface the real failure, not just `q.error`).
+
+    Must be called from inside an `except` block so `traceback.format_exc()`
+    resolves to the exception currently being handled.
+
+    `log_cb` does file I/O and can itself raise (disk full, permissions,
+    etc.); that must never mask or replace the *original* failure the caller
+    already recorded (e.g. in `q.error`), so any error from `log_cb` here is
+    swallowed after being noted on stdout.
+    """
+    try:
+        log_cb(f"FAILED: {error_str}\n{traceback.format_exc()}")
+    except Exception as log_exc:  # noqa: BLE001 -- must never mask the original error
+        logger.error(
+            "job %s %s: failed to write failure detail to log file: %s",
+            job_id, target_id, log_exc,
+        )
+    logger.error("job %s %s FAILED: %s", job_id, target_id, error_str)
+
+
 async def _upload_with_retry(fn, *args, **kwargs):
     """Run a (blocking) hf upload in a thread, retrying with backoff (I6).
 
@@ -108,6 +140,7 @@ async def _run_lane_a(job: Job, source_dir: Path, calibration, hf_client, progre
         setup_cb = _mk_log_cb(job.id, "__lane_a_setup__", progress, setup_tail)
         model, tokenizer = await asyncio.to_thread(load_model_for_safetensors, source_dir, setup_cb)
     except Exception as e:
+        _log_failure(setup_cb, job.id, "__lane_a_setup__", f"Lane A setup failed: {e}")
         for q in safetensors_quants:
             q.status = QuantStatus.SKIPPED
             q.error = f"Lane A setup failed: {e}"
@@ -155,6 +188,7 @@ async def _run_one_safetensors_quant(job, q, model, tokenizer, source_dir, calib
     except Exception as e:
         q.status = QuantStatus.FAILED
         q.error = f"{type(e).__name__}: {e}"
+        _log_failure(log_cb, job.id, q.quant_id, q.error)
     finally:
         q.finished_at = datetime.now(timezone.utc)
         q.elapsed_seconds = time.time() - t0
@@ -176,6 +210,7 @@ async def _run_lane_b(job: Job, source_dir: Path, calibration, hf_client, progre
         setup_cb = _mk_log_cb(job.id, "__lane_b_setup__", progress, setup_tail)
         await asyncio.to_thread(convert_to_bf16_gguf, source_dir, bf16_gguf, setup_cb)
     except Exception as e:
+        _log_failure(setup_cb, job.id, "__lane_b_setup__", f"Lane B setup failed: {e}")
         for q in gguf_quants:
             q.status = QuantStatus.SKIPPED
             q.error = f"Lane B setup failed: {e}"
@@ -194,6 +229,7 @@ async def _run_lane_b(job: Job, source_dir: Path, calibration, hf_client, progre
             imatrix_path = workdir / "imatrix.dat"
             await asyncio.to_thread(compute_imatrix, bf16_gguf, cal_text, imatrix_path, imatrix_cb)
         except Exception as e:
+            _log_failure(imatrix_cb, job.id, "__imatrix__", f"imatrix failed: {e}")
             for q in gguf_quants:
                 if get_quant(q.quant_id).family == QuantFamily.GGUF_I:
                     q.status = QuantStatus.SKIPPED
@@ -253,6 +289,7 @@ async def _run_one_gguf_quant(job, q, bf16_gguf, imatrix_path, source_dir, defau
     except Exception as e:
         q.status = QuantStatus.FAILED
         q.error = f"{type(e).__name__}: {e}"
+        _log_failure(log_cb, job.id, q.quant_id, q.error)
     finally:
         q.finished_at = datetime.now(timezone.utc)
         q.elapsed_seconds = time.time() - t0
