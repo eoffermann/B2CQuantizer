@@ -1421,7 +1421,7 @@ def build_frndobrain_tokenizer(source_dir: Path):
         )
     # Load from the local source_dir (tekken.json lives here).
     tok = MistralTokenizer.from_file(str(source_dir / "tekken.json"),
-                                      mode=ValidationMode.finetuning)
+                                      mode=ValidationMode.serving)  # user-approved change; serving-mode rendering = serving-time tokenization, and accepts user-terminated calibration samples
     it = tok.instruct_tokenizer
     if not hasattr(it, _TOOL_PLACEMENT_ATTR):
         raise RuntimeError(

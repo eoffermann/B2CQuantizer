@@ -137,7 +137,6 @@ def test_render_calibration_frndobrain_real_tokenizer_path(tmp_path):
     tok = build_frndobrain_tokenizer(tmp_path)
 
     # (a) Sample with only "messages" (no "tools" key).
-    # In finetuning mode, last message must be assistant, so pair user+assistant.
     sample_messages_only = {
         "messages": [
             {"role": "user", "content": "Hello, what is 2+2?"},
@@ -163,6 +162,57 @@ def test_render_calibration_frndobrain_real_tokenizer_path(tmp_path):
     assert "[INST]" in rendered
 
 
+def test_render_calibration_frndobrain_user_only_sample_renders(tmp_path):
+    """Regression test for the confirmed Lane A repro: in the old
+    ValidationMode.finetuning, a user-only-terminated sample (the shape of
+    the ENTIRE bundled calibration corpus) failed with
+    "Expected last role Assistant for finetuning but got user". Under the
+    fixed ValidationMode.serving (+ the `model=` this mode requires), a
+    user-terminated sample must render successfully -- this is real
+    serving-time tokenization: the model hasn't answered yet."""
+    import b2cq.workers.safetensors as st
+
+    _write_synthetic_v11_tekken_json(tmp_path / "tekken.json")
+    tok = build_frndobrain_tokenizer(tmp_path)
+
+    sample_user_only = {
+        "messages": [
+            {"role": "user", "content": "Hello, what is 2+2?"},
+        ]
+    }
+    rendered = st._render_calibration_frndobrain(tok, sample_user_only)
+    assert isinstance(rendered, str)
+    assert len(rendered) > 0
+    assert rendered == "<s>[INST]Hello, what is 2+2?[/INST]"
+
+
+def test_render_calibration_frndobrain_assistant_terminated_sample_renders(tmp_path):
+    """Companion to the user-only case: an assistant-terminated sample (the
+    other common calibration shape -- full user+assistant exchanges) must
+    ALSO still render under ValidationMode.serving. Serving mode normally
+    rejects a request ending on an assistant turn (it expects the model to
+    generate that turn), so `_render_calibration_frndobrain` must set
+    `continue_final_message=True` for these samples, which renders the
+    assistant content as a continuation rather than raising
+    InvalidMessageStructureException."""
+    import b2cq.workers.safetensors as st
+
+    _write_synthetic_v11_tekken_json(tmp_path / "tekken.json")
+    tok = build_frndobrain_tokenizer(tmp_path)
+
+    sample_assistant_terminated = {
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there"},
+        ]
+    }
+    rendered = st._render_calibration_frndobrain(tok, sample_assistant_terminated)
+    assert isinstance(rendered, str)
+    assert len(rendered) > 0
+    assert "[INST]Hello[/INST]" in rendered
+    assert rendered.endswith("Hi there")
+
+
 # ---------------------------------------------------------------------------
 # (d) quantize_safetensors dispatch: FrndoBrain hard-fail + HF fallback
 # ---------------------------------------------------------------------------
@@ -179,11 +229,11 @@ class _FakeModel:
 
 
 def _install_fake_oneshot(monkeypatch, recorder):
-    """Insert a fake `llmcompressor.transformers` module into sys.modules so
-    `from llmcompressor.transformers import oneshot` succeeds without the
-    real (heavy, Docker-image-only) llmcompressor package installed. The
-    fake `oneshot` writes the minimal output quantize_safetensors verifies
-    (config.json + a *.safetensors file) and records its call args/kwargs.
+    """Insert a fake `llmcompressor` module into sys.modules so
+    `from llmcompressor import oneshot` succeeds without the real (heavy,
+    Docker-image-only) llmcompressor package installed. The fake `oneshot`
+    writes the minimal output quantize_safetensors verifies (config.json + a
+    *.safetensors file) and records its call args/kwargs.
     """
 
     def fake_oneshot(**kwargs):
@@ -194,12 +244,9 @@ def _install_fake_oneshot(monkeypatch, recorder):
         (out / "model.safetensors").write_bytes(b"")
 
     fake_llmcompressor = types.ModuleType("llmcompressor")
-    fake_transformers_submodule = types.ModuleType("llmcompressor.transformers")
-    fake_transformers_submodule.oneshot = fake_oneshot
-    fake_llmcompressor.transformers = fake_transformers_submodule
+    fake_llmcompressor.oneshot = fake_oneshot
 
     monkeypatch.setitem(sys.modules, "llmcompressor", fake_llmcompressor)
-    monkeypatch.setitem(sys.modules, "llmcompressor.transformers", fake_transformers_submodule)
 
 
 def test_quantize_safetensors_frndobrain_hard_fails_on_render_error(tmp_path, monkeypatch):
@@ -263,6 +310,13 @@ def test_quantize_safetensors_generic_uses_hf_chat_template(tmp_path, monkeypatc
 
     assert len(apply_chat_template_calls) == 1
     assert len(oneshot_calls) == 1
-    assert oneshot_calls[0]["dataset"] == ["<rendered via HF chat template>"]
+    # dataset= must be a datasets.Dataset (not a bare list) -- see
+    # quantize_safetensors' oneshot() call: llmcompressor's `dataset` param
+    # only accepts str | Dataset | DatasetDict, not a bare list[str].
+    from datasets import Dataset
+
+    ds = oneshot_calls[0]["dataset"]
+    assert isinstance(ds, Dataset)
+    assert ds["text"] == ["<rendered via HF chat template>"]
     assert (output_dir / "config.json").exists()
     assert any(output_dir.glob("*.safetensors"))

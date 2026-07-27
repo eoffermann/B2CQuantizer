@@ -137,6 +137,18 @@ def _build_awq_mappings_scoped(model):
 
 
 def _build_recipe(format: str, arch: str, model):
+    """Build the llm-compressor recipe (list of Modifiers) for `format`.
+
+    All five recipes are built exclusively from PRESET quantization schemes
+    (compressed_tensors/quantization/quant_scheme.py `PRESET_SCHEMES`) plus
+    the modifier-level `targets`/`ignore`/`mappings` fields that actually
+    exist on GPTQModifier/AWQModifier/QuantizationModifier. Every Modifier in
+    llm-compressor 0.10 has pydantic `model_config = ConfigDict(extra="forbid")`
+    (inherited via QuantizationMixin / QuantizationArgs / QuantizationScheme),
+    so passing any kwarg that isn't a real field (e.g. the old `group_size=`,
+    `sym=`, `weights=`, `observer_options=`) raises a ValidationError before
+    any GPU work starts. See wheel citations below for each format.
+    """
     if arch not in (_MULTIMODAL_ARCH, _TEXT_ARCH):
         raise ValueError(
             f"Unsupported architecture: {arch!r}. B2CQuantizer v1 supports only Mistral/Mistral3."
@@ -145,61 +157,64 @@ def _build_recipe(format: str, arch: str, model):
     from llmcompressor.modifiers.quantization import QuantizationModifier
     from llmcompressor.modifiers.quantization.gptq import GPTQModifier
     from llmcompressor.modifiers.awq import AWQModifier
-    from compressed_tensors.quantization import (
-        QuantizationArgs,
-        QuantizationScheme,
-        QuantizationStrategy,
-        QuantizationType,
-    )
 
     ignore = _IGNORE_MULTIMODAL if arch == _MULTIMODAL_ARCH else _IGNORE_TEXT
 
     if format == "W4A16_GPTQ":
-        return [GPTQModifier(targets="Linear", scheme="W4A16", ignore=ignore, group_size=128, sym=True)]
+        # GPTQModifier(Modifier, QuantizationMixin) has NO `group_size`/`sym`
+        # fields (llmcompressor/modifiers/quantization/gptq/base.py -- its own
+        # fields are sequential_targets/block_size/dampening_frac/actorder/
+        # offload_hessians; the rest come from QuantizationMixin: config_groups/
+        # targets/ignore/scheme/kv_cache_scheme/*_observer). The preset name
+        # "W4A16" already encodes 4-bit int, symmetric, group_size=128
+        # (compressed_tensors/quantization/quant_scheme.py: W4A16 = dict(
+        #   weights=QuantizationArgs(num_bits=4, type=INT, strategy=GROUP,
+        #   group_size=128, symmetric=True)) ) -- the preset alone is correct.
+        return [GPTQModifier(targets="Linear", scheme="W4A16", ignore=ignore)]
 
     if format == "W4A16_AWQ":
-        awq_kwargs = {"ignore": ignore}
+        # AWQModifier(Modifier, QuantizationMixin) (modifiers/awq/base.py)
+        # takes `scheme`/`config_groups` + `mappings` directly -- it IS a
+        # QuantizationMixin, so it does not need a separate QuantizationModifier
+        # paired after it (see AWQModifier docstring's example recipe, which
+        # shows a single AWQModifier with `mappings` + `config_groups`). Preset
+        # "W4A16_ASYM" = 4-bit int, group_size=128, symmetric=False -- the
+        # asymmetric counterpart of W4A16, matching AWQ's asymmetric default.
+        awq_kwargs = {"scheme": "W4A16_ASYM", "ignore": ignore}
         if arch == _MULTIMODAL_ARCH:
             # Default AWQ mappings error out on Mistral3's wrapped decoder
             # layer tree -- build explicit per-layer mappings instead. For
             # text-only Mistral, leaving `mappings` unset uses llm-compressor's
-            # defaults, which work fine there.
+            # defaults (AWQ_MAPPING_REGISTRY["MistralForCausalLM"]), which work
+            # fine there.
             awq_kwargs["mappings"] = _build_awq_mappings_scoped(model)
-        weight_quant = QuantizationModifier(
-            config_groups={
-                "group_0": QuantizationScheme(
-                    targets=["Linear"],
-                    weights=QuantizationArgs(
-                        num_bits=4,
-                        type=QuantizationType.INT,
-                        symmetric=False,
-                        strategy=QuantizationStrategy.GROUP,
-                        group_size=128,
-                        actorder=None,
-                    ),
-                )
-            }
-        )
-        return [AWQModifier(**awq_kwargs), weight_quant]
+        return [AWQModifier(**awq_kwargs)]
 
     if format == "NVFP4":
         # No GPTQ/AWQ pass: FP4 rounding doesn't benefit from Hessian-based
         # or activation-smoothing calibration the way integer schemes do.
+        # Preset "NVFP4" exists in PRESET_SCHEMES (quant_scheme.py): 4-bit
+        # float, TENSOR_GROUP strategy, group_size=16, FP8_E4M3 scale/zp dtype,
+        # with a matching LOCAL-dynamic input_activations entry.
         return [QuantizationModifier(targets="Linear", scheme="NVFP4", ignore=ignore)]
 
-    if format in ("FP8_E4M3", "FP8_E5M2"):
-        # E4M3 vs E5M2 differ only in the float8 dtype passed through
-        # observer_options; exact param name/values should be re-verified
-        # against the installed llm-compressor version in the GPU image.
-        dtype = "float8_e4m3fn" if format == "FP8_E4M3" else "float8_e5m2"
-        weights_args = QuantizationArgs(
-            num_bits=8,
-            type=QuantizationType.FLOAT,
-            symmetric=True,
-            strategy=QuantizationStrategy.CHANNEL,
-            observer_options={"dtype": dtype},
-        )
-        return [QuantizationModifier(targets="Linear", scheme="FP8", ignore=ignore, weights=weights_args)]
+    if format == "FP8_E4M3":
+        # Preset "FP8" (quant_scheme.py) is 8-bit float TENSOR-strategy
+        # weights + static TENSOR-strategy input_activations. compressed_tensors
+        # 0.10's QuantizationArgs has NO `observer_options` field (extra=forbid)
+        # and its float8 dtype is hardcoded to FP8_E4M3_DATA.dtype everywhere
+        # (pytorch_dtype()/round_to_quantized_type_args in quant_args.py) --
+        # there is no dtype-selection knob, so "FP8" *is* E4M3.
+        return [QuantizationModifier(targets="Linear", scheme="FP8", ignore=ignore)]
+
+    if format == "FP8_E5M2":
+        # compressed_tensors/quantization/quant_args.py defines FP8_E4M3_DATA
+        # only -- no FP8_E5M2_DATA class exists, and both pytorch_dtype() and
+        # round_to_quantized_type_args() hardcode FP8_E4M3_DATA.dtype for any
+        # 8-bit float QuantizationArgs. There is no preset, no dtype param, and
+        # no code path in llm-compressor 0.10 / compressed-tensors that can
+        # produce e5m2 weights. This is a genuine gap, not a naming mismatch.
+        raise ValueError("FP8 E5M2 is not supported by llm-compressor 0.10; use FP8 E4M3")
 
     raise ValueError(f"unsupported safetensors format: {format!r}")
 
@@ -241,8 +256,18 @@ def build_frndobrain_tokenizer(source_dir: Path):
             "source and update the pin (see SPEC §14 for the drift history)."
         )
     # Load from the local source_dir (tekken.json lives here).
+    # NOTE: `serving` mode (not `finetuning`) is deliberate -- confirmed repro:
+    # in `finetuning` mode, mistral-common's MistralRequestValidator rejects
+    # ANY calibration sample that doesn't end on an assistant turn ("Expected
+    # last role Assistant for finetuning but got user" --
+    # mistral_common/protocol/instruct/validator.py:_validate_last_message),
+    # which is the entire bundled corpus's user-only samples. `serving` mode
+    # rendering is serving-time tokenization (what the model actually sees at
+    # inference), and correctly accepts user-terminated calibration samples.
+    # See `_render_calibration_frndobrain` for the corresponding
+    # `model=`/`continue_final_message=` handling this mode switch requires.
     tok = MistralTokenizer.from_file(str(Path(source_dir) / "tekken.json"),
-                                      mode=ValidationMode.finetuning)
+                                      mode=ValidationMode.serving)
     it = tok.instruct_tokenizer
     if not hasattr(it, _TOOL_PLACEMENT_ATTR):
         raise RuntimeError(
@@ -264,7 +289,24 @@ def _render_calibration_frndobrain(mtok, sample: dict) -> str:
     render with V11's [CALL_ID] format, etc.)."""
     from mistral_common.protocol.instruct.request import ChatCompletionRequest
 
-    req = ChatCompletionRequest(messages=sample["messages"], tools=sample.get("tools"))
+    messages = sample["messages"]
+    # `serving`-mode validation (see build_frndobrain_tokenizer) requires
+    # `model` to be set (MistralRequestValidator.validate_request raises
+    # "Model name parameter is required for serving mode" otherwise -- the
+    # value itself is not otherwise validated/used for rendering). It also
+    # requires the request to end on a user/tool turn UNLESS
+    # `continue_final_message=True` is set, in which case an assistant-
+    # terminated conversation renders as a continuation of that assistant
+    # turn (no closing tag after the assistant content) rather than being
+    # rejected -- so both user-terminated and assistant-terminated
+    # calibration samples render correctly.
+    continue_final_message = bool(messages) and messages[-1].get("role") == "assistant"
+    req = ChatCompletionRequest(
+        messages=messages,
+        tools=sample.get("tools"),
+        model="b2cq-frndobrain-calibration",
+        continue_final_message=continue_final_message,
+    )
     return mtok.encode_chat_completion(req).text
 
 
@@ -337,13 +379,29 @@ def quantize_safetensors(
         log_cb("Calibration rendering via HF chat template")
         texts = [_render_calibration_hf(tokenizer, s) for s in samples]
 
-    from llmcompressor.transformers import oneshot
+    # `llmcompressor.transformers` no longer re-exports `oneshot` in 0.10
+    # (llmcompressor/transformers/__init__.py only does `from .utils import *`
+    # + `from .data import TextGenerationDataset`) -- the verified path is the
+    # top-level package, which re-exports it via
+    # llmcompressor/entrypoints/__init__.py -> llmcompressor/__init__.py
+    # (`from llmcompressor.entrypoints import Oneshot, oneshot, model_free_ptq`).
+    from llmcompressor import oneshot
+    from datasets import Dataset
 
+    # oneshot()'s `dataset` param is typed `str | Dataset | DatasetDict | None`
+    # (llmcompressor/entrypoints/oneshot.py:266) -- a bare list[str] is not one
+    # of those. Internally, `get_processed_dataset` -> `TextGenerationDataset.
+    # __call__` (llmcompressor/transformers/data/base.py:95-101) only calls
+    # `self.load_dataset()` (which needs a HF dataset id/path) when
+    # `isinstance(dataset, str)`; otherwise it treats the passed object
+    # directly as a `datasets.Dataset` and looks for `dataset_args.text_column`
+    # (default "text") to feed the tokenizer. So we wrap our rendered strings
+    # in a one-column `datasets.Dataset` under the "text" column.
     log_cb(f"Starting oneshot quantization: {format}")
     oneshot(
         model=model,
         recipe=recipe,
-        dataset=texts,
+        dataset=Dataset.from_dict({"text": texts}),
         output_dir=str(output_dir),
         num_calibration_samples=len(texts),
         max_seq_length=2048,

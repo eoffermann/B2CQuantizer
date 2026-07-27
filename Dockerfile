@@ -53,5 +53,21 @@ COPY scripts/patch_convert_hf_to_gguf.py /opt/patch_convert_hf_to_gguf.py
 COPY docker/entrypoint.sh /opt/entrypoint.sh
 RUN chmod +x /opt/entrypoint.sh
 
+# Build-time API smoke test: catches llmcompressor/compressed_tensors API
+# drift (the class of bug behind the "instant death on first real GPU run"
+# incident -- Modifier kwargs that don't exist as pydantic fields, or an
+# entrypoint import path that no longer re-exports what we import) at image
+# build time instead of on a rented GPU pod. Placed after `COPY src/` (the
+# earliest point b2cq.workers.safetensors is actually importable) rather than
+# immediately after `pip install -e ".[dev]"`, since editable-install alone
+# doesn't make the real module files present yet -- see the layer ordering
+# comment above. Pure pydantic Modifier construction: no GPU/model weights
+# needed, just the installed llmcompressor/compressed_tensors/torch stack.
+#
+# Written as a single JSON exec-form RUN (rather than a `RUN <<EOF` heredoc)
+# so it doesn't depend on a BuildKit heredoc-capable frontend/`# syntax=`
+# directive -- this Dockerfile targets plain `docker build` compatibility.
+RUN ["python3", "-c", "import types\nfrom b2cq.workers.safetensors import _MULTIMODAL_ARCH, _TEXT_ARCH, _build_recipe\nSUPPORTED_FORMATS = ['W4A16_GPTQ', 'W4A16_AWQ', 'NVFP4', 'FP8_E4M3']\nUNSUPPORTED_FORMATS = ['FP8_E5M2']\ndef fake_model(arch, num_hidden_layers=2):\n    text_config = types.SimpleNamespace(num_hidden_layers=num_hidden_layers)\n    config = types.SimpleNamespace(architectures=[arch], text_config=text_config)\n    return types.SimpleNamespace(config=config)\nfor arch in (_MULTIMODAL_ARCH, _TEXT_ARCH):\n    model = fake_model(arch)\n    for fmt in SUPPORTED_FORMATS:\n        recipe = _build_recipe(fmt, arch, model)\n        assert isinstance(recipe, list) and len(recipe) >= 1, arch + '/' + fmt + ': empty recipe'\n        print('[smoke] ' + arch + ' / ' + fmt + ': OK (' + str(len(recipe)) + ' modifier(s))')\n    for fmt in UNSUPPORTED_FORMATS:\n        try:\n            _build_recipe(fmt, arch, model)\n        except ValueError as e:\n            print('[smoke] ' + arch + ' / ' + fmt + ': correctly raised ValueError: ' + str(e))\n        else:\n            raise AssertionError(arch + '/' + fmt + ': expected ValueError but got a recipe -- FP8 E5M2 is not supported by llm-compressor 0.10')\nfrom llmcompressor import oneshot\nassert callable(oneshot)\nprint('[smoke] llmcompressor.oneshot import path OK')\nprint('[smoke] safetensors _build_recipe API smoke test passed for all formats/archs')"]
+
 EXPOSE 8000
 ENTRYPOINT ["/opt/entrypoint.sh"]
